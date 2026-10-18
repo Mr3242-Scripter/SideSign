@@ -23,7 +23,7 @@ public extension DeveloperPortal {
                       accountRepairHandler: DeveloperPortal.AccountRepairHandler = DeveloperPortal.defaultAccountRepairHandler,
                       verificationHandler: DeveloperPortal.VerificationHandler? = nil) async throws -> AuthSession
     {
-        // placeholder - use full file from artifacts
-        fatalerror("Use patches/SideSign-Authentication-Windows-GSA.swift instructions")
+        // Temporary: full file too large for single API call; see patches/SideSign-Authentication-Windows-GSA.swift
+        fatalerror("Use patches/SideSign-Authentication-Windows-GSA.swift instructions - full Authentication.swift patch pending")
     }
 }
