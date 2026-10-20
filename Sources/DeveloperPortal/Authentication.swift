@@ -725,7 +725,7 @@ public extension DeveloperPortal {
         debugLog("[SideSign] Requesting trusted device 2FA code...")
         verboseLog("[SideSign] sendTrustedDevice2FACodeRequest for dsid: \(context.dsid)")
 
-        var request = makeTwoFactorAuthRequest(url: Constants.URLs.trustedDevice, context: context)
+        var request = makeTwoFactorAuthRequest(url: Constants.URLs.trustedDevice, context: context, asMac: true)
         request.httpMethod = "GET"
 
         if let allHeaders = request.allHTTPHeaderFields {
@@ -758,16 +758,17 @@ public extension DeveloperPortal {
             return "1"
         }()
 
-        let serverInfo: [String: any Sendable] = [
-            "mode": requestedMode,
-            "phoneNumber.id": sanitizedPhoneID
+        // SideInstaller: PUT JSON to https://gsa.apple.com/auth/verify/phone
+        let phoneURL = URL(string: "https://gsa.apple.com/auth/verify/phone")!
+        var request = makeTwoFactorAuthRequest(url: phoneURL, context: context, asMac: true)
+        request.httpMethod = "PUT"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        let jsonBody: [String: Any] = [
+            "phoneNumber": ["id": Int(sanitizedPhoneID) ?? sanitizedPhoneID],
+            "mode": requestedMode
         ]
-
-        var request = makeTwoFactorAuthRequest(url: Constants.URLs.phonePutURL(mode: requestedMode), context: context)
-        request.httpMethod = "POST"
-        request.httpBody = try PropertyListSerialization.data(fromPropertyList: [
-            "serverInfo": serverInfo
-        ], format: .xml, options: 0)
+        request.httpBody = try JSONSerialization.data(withJSONObject: jsonBody)
 
         if let allHeaders = request.allHTTPHeaderFields {
             verboseLog("[SideSign] sendPhone2FACodeRequest HTTP headers: \(prettyJSONString(from: sanitizeHeadersForLogging(allHeaders)))")
@@ -852,7 +853,7 @@ public extension DeveloperPortal {
     }
 
     private func validateTrustedDevice2FACode(code: String, context: TwoFactorAuthContext) async throws -> TwoFactorAuthValidationResult {
-        var verifyRequest = makeTwoFactorAuthRequest(url: Constants.URLs.grandSlamValidate, context: context)
+        var verifyRequest = makeTwoFactorAuthRequest(url: Constants.URLs.grandSlamValidate, context: context, asMac: true)
         verifyRequest.setValue(code, forHTTPHeaderField: "security-code")
 
         if let allHeaders = verifyRequest.allHTTPHeaderFields {
@@ -871,7 +872,7 @@ public extension DeveloperPortal {
                                       mode: String,
                                       context: TwoFactorAuthContext) async throws -> TwoFactorAuthValidationResult
     {
-        var verifyRequest = makeTwoFactorAuthRequest(url: Constants.URLs.phoneSecurityCode, context: context)
+        var verifyRequest = makeTwoFactorAuthRequest(url: Constants.URLs.phoneSecurityCode, context: context, asMac: true)
         verifyRequest.httpMethod = "POST"
         verifyRequest.httpBody = try PropertyListSerialization.data(fromPropertyList: [
             "securityCode.code": code,
@@ -989,7 +990,8 @@ public extension DeveloperPortal {
         return request
     }
 
-    /// SideInstaller `send_auth`: on bare 403 for Windows client, retry as Mac.
+        /// SideInstaller `send_auth`: gsa.apple.com/auth often refuses Windows with 403/5xx;
+    /// retry once as Mac (MAC_CLIENT_INFO). Do NOT treat generic "ec" substring as service error.
     private func performTwoFactorRequest(_ request: URLRequest, context: TwoFactorAuthContext, actionName: String) async throws -> (Data, HTTPURLResponse) {
         var current = request
         var triedMac = false
@@ -998,11 +1000,12 @@ public extension DeveloperPortal {
             let http = response as? HTTPURLResponse
             let status = http?.safeStatusCode ?? 0
             let body = String(data: data, encoding: .utf8) ?? ""
-            // Bare 403 (no Apple serviceErrors) = page refused the client identity
-            let hasServiceError = body.localizedCaseInsensitiveContains("serviceErrors") || body.localizedCaseInsensitiveContains("ec")
-            let bare403 = (status == 403) && !hasServiceError
-            if bare403 && !triedMac {
-                debugLog("[SideSign] \(actionName) HTTP 403 for Windows client — retrying as Mac (SideInstaller parity)")
+
+            let shouldRetryAsMac =
+                !triedMac
+                && (status == 403 || status == 503 || status == 500 || status == 433 || status == 0)
+            if shouldRetryAsMac {
+                debugLog("[SideSign] \(actionName) HTTP \(status) — retrying as Mac (SideInstaller 2FA parity)")
                 guard let url = current.url else {
                     throw ServerError.badServerResponse(reason: "\(actionName) missing URL", jsonPayload: body)
                 }
@@ -1020,7 +1023,7 @@ public extension DeveloperPortal {
         }
     }
 
-    private func parsePlistOrJSON(_ data: Data) -> [String: any Sendable]? {
+private func parsePlistOrJSON(_ data: Data) -> [String: any Sendable]? {
            (try? PropertyListSerialization.propertyList(from: data, format: nil)) as? [String: any Sendable]
         ?? (try? JSONSerialization.jsonObject(with: data, options: [])) as? [String: any Sendable]
     }
