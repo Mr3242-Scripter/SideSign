@@ -999,8 +999,8 @@ public extension DeveloperPortal {
             let status = http?.safeStatusCode ?? 0
             let body = String(data: data, encoding: .utf8) ?? ""
             // Bare 403 (no Apple serviceErrors) = page refused the client identity
-            let bare403 = status == 403 && !body.localizedCaseInsensitiveContains("serviceErrors")
-                && !body.localizedCaseInsensitiveContains(""ec"")
+            let hasServiceError = body.localizedCaseInsensitiveContains("serviceErrors") || body.localizedCaseInsensitiveContains("ec")
+            let bare403 = (status == 403) && !hasServiceError
             if bare403 && !triedMac {
                 debugLog("[SideSign] \(actionName) HTTP 403 for Windows client — retrying as Mac (SideInstaller parity)")
                 guard let url = current.url else {
