@@ -255,8 +255,21 @@ public final class DeveloperPortal: DeveloperPortalAPI, Sendable {
 
     let session: URLSession
 
-    public init(session: URLSession = .shared, customHeaders: SideSignHeaders = SideSignHeaders()) {
-        self.session = session
+    /// SideInstaller uses pool_max_idle_per_host(0) so GSA never reuses connections
+    /// (reused connections often get HTTP 5xx / empty bodies).
+    private static func makeGSASession() -> URLSession {
+        let config = URLSessionConfiguration.ephemeral
+        config.httpShouldUsePipelining = false
+        config.httpMaximumConnectionsPerHost = 1
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        config.urlCache = nil
+        config.timeoutIntervalForRequest = 60
+        config.timeoutIntervalForResource = 120
+        return URLSession(configuration: config)
+    }
+
+    public init(session: URLSession? = nil, customHeaders: SideSignHeaders = SideSignHeaders()) {
+        self.session = session ?? Self.makeGSASession()
         self.cachedCustomHeaders = customHeaders
     }
 
@@ -327,7 +340,7 @@ public final class DeveloperPortal: DeveloperPortalAPI, Sendable {
             "X-Apple-I-MD-LU": a.localUserID,
             "X-Apple-I-MD-RINFO": a.routingInfo,
             "X-Mme-Device-Id": a.deviceID,
-            "X-MMe-Client-Info": a.clientInfo,
+            "X-Mme-Client-Info": a.clientInfo,
             "X-Apple-I-Client-Time": a.clientTime,
             "X-Apple-Locale": a.locale,
             "X-Apple-I-Locale": a.locale,
@@ -438,7 +451,7 @@ public final class DeveloperPortal: DeveloperPortalAPI, Sendable {
             headers["X-Apple-I-MD-LU"] = a.localUserID
             headers["X-Apple-I-MD-RINFO"] = a.routingInfo
             headers["X-Mme-Device-Id"] = a.deviceID
-            headers["X-MMe-Client-Info"] = a.clientInfo
+            headers["X-Mme-Client-Info"] = a.clientInfo
             headers["X-Apple-I-Client-Time"] = a.clientTime
             headers["X-Apple-Locale"] = a.locale
             headers["X-Apple-I-Locale"] = a.locale
