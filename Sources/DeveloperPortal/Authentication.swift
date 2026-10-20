@@ -345,7 +345,7 @@ public extension DeveloperPortal {
         let headers: [String: String] = [
             "Content-Type": "text/x-xml-plist",
             "Accept": "text/x-xml-plist",
-            "X-MMe-Client-Info": clientInfo,
+            "X-Mme-Client-Info": clientInfo,
             "User-Agent": userAgent,
             "X-Xcode-Version": "14.2 (14C18)",
             "X-Apple-App-Info": "com.apple.gs.xcode.auth",
@@ -381,6 +381,21 @@ public extension DeveloperPortal {
                 continue
             }
             break
+        }
+
+        // After retries, refuse HTML/503 so callers purge adi and try another server
+        if statusCode == 503 || statusCode == 433 {
+            let rawStr = String(data: data, encoding: .utf8) ?? data.hexEncodedString()
+            debugLog("[SideSign] GrandSlam still HTTP \(statusCode) after retries: \(rawStr.prefix(200))")
+            throw ServerError.badServerResponse(
+                reason: "Apple sign-in refused the request (HTTP \(statusCode)). Try a Windows anisette server and sign in again.",
+                jsonPayload: rawStr
+            )
+        }
+        if statusCode != 0 && !(200...299).contains(statusCode) {
+            let rawStr = String(data: data, encoding: .utf8) ?? data.hexEncodedString()
+            debugLog("[SideSign] GrandSlam HTTP \(statusCode): \(rawStr.prefix(200))")
+            // continue to parse if body might be a plist with Status.ec; if empty/HTML, fail below
         }
 
         guard !data.isEmpty else {
@@ -946,14 +961,14 @@ public extension DeveloperPortal {
             "Accept": "application/x-buddyml",
             "Accept-Language": "en-us",
             "Content-Type": "application/x-plist",
-            "User-Agent": h.developerServices.userAgent,
+            "User-Agent": (a.userAgent.isEmpty || a.userAgent.contains("Macintosh") || a.userAgent.contains("Xcode") ? "akd/1.0 CFNetwork/808.1.4" : a.userAgent),
             "X-Apple-App-Info": h.grandSlam.authApp,
             "X-Xcode-Version": context.xcodeVersion,
             "X-Apple-Identity-Token": encodedIdentityToken,
             "X-Apple-I-MD": a.oneTimePassword,
             "X-Apple-I-MD-M": a.machineID,
             "X-Mme-Device-Id": a.deviceID,
-            "X-MMe-Client-Info": a.clientInfo,
+            "X-Mme-Client-Info": a.clientInfo,
             "X-Apple-I-MD-LU": a.localUserID,
             "X-Apple-I-MD-RINFO": a.routingInfo,
             "X-Apple-I-SRL-NO": a.serialNumber,
