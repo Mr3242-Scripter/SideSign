@@ -764,8 +764,10 @@ public extension DeveloperPortal {
         request.httpMethod = "PUT"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
+        // SideInstaller uses numeric phone id (u32); default 1
+        let phoneIdValue: Int = Int(sanitizedPhoneID) ?? 1
         let jsonBody: [String: Any] = [
-            "phoneNumber": ["id": Int(sanitizedPhoneID) ?? sanitizedPhoneID],
+            "phoneNumber": ["id": phoneIdValue],
             "mode": requestedMode
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: jsonBody)
