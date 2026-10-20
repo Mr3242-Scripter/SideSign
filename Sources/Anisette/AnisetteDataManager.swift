@@ -433,8 +433,17 @@ public final class AnisetteDataManager: @unchecked Sendable {
             }
         }
 
-        let clientInfo = headers?.clientInfo ?? Constants.Anisette.defaultClientInfo
-        let client = try await getClient(for: resolvedMode, clientInfo: clientInfo)
+        let windowsClientInfo = "<PC> <Windows;6.2(0,0);9200> <com.apple.AuthKit/1 (com.apple.iTunes/12.12.4.1)>"
+        let akdUserAgent = "akd/1.0 CFNetwork/808.1.4"
+        var clientInfo = headers?.clientInfo ?? windowsClientInfo
+        if clientInfo.isEmpty || clientInfo.contains("MacBook") || clientInfo.contains("<Android;") {
+            clientInfo = windowsClientInfo
+        }
+        var userAgent = headers?.userAgent ?? akdUserAgent
+        if userAgent.isEmpty || userAgent.contains("Macintosh") || userAgent.contains("Xcode") {
+            userAgent = akdUserAgent
+        }
+        let client = try await getClient(for: resolvedMode, clientInfo: clientInfo, userAgent: userAgent)
 
         do {
             let (rawHeaders, newBlob) = try await client.getAnisetteData(
@@ -470,14 +479,14 @@ public final class AnisetteDataManager: @unchecked Sendable {
         }
     }
 
-    private func getClient(for mode: AnisetteMode, clientInfo: String) async throws -> AnisetteClient {
+    private func getClient(for mode: AnisetteMode, clientInfo: String, userAgent: String = "akd/1.0 CFNetwork/808.1.4") async throws -> AnisetteClient {
         switch mode {
         case .remote(let server):
             try FileManager.default.createDirectory(at: provisioningDir, withIntermediateDirectories: true)
             return try AnisetteClient(
                 provisioningDir: provisioningDir,
                 clientInfo: clientInfo,
-                userAgent: Constants.Anisette.defaultUserAgent,
+                userAgent: userAgent,
                 lookupURL: Constants.Anisette.URLs.grandSlamLookup,
                 requiredLibraries: Constants.Anisette.Libraries.requiredNames,
                 provider: RemoteAnisetteDataProvider(serverURL: server)
@@ -489,7 +498,7 @@ public final class AnisetteDataManager: @unchecked Sendable {
             return try AnisetteClient(
                 provisioningDir: targetProvDir,
                 clientInfo: clientInfo,
-                userAgent: Constants.Anisette.defaultUserAgent,
+                userAgent: userAgent,
                 lookupURL: Constants.Anisette.URLs.grandSlamLookup,
                 requiredLibraries: Constants.Anisette.Libraries.requiredNames,
                 libraryDirectoryResolver: { libDir }
@@ -648,7 +657,7 @@ public final class AnisetteDataManager: @unchecked Sendable {
         self.localProvider = try AnisetteClient(
             provisioningDir: prov,
             clientInfo: clientInfo,
-            userAgent: Constants.Anisette.defaultUserAgent,
+            userAgent: "akd/1.0 CFNetwork/808.1.4",
             lookupURL: Constants.Anisette.URLs.grandSlamLookup,
             requiredLibraries: Constants.Anisette.Libraries.requiredNames,
             libraryDirectoryResolver: { libDir }
@@ -699,7 +708,7 @@ public final class AnisetteDataManager: @unchecked Sendable {
             let provider = try AnisetteClient(
                 provisioningDir: prov,
                 clientInfo: clientInfo,
-                userAgent: Constants.Anisette.defaultUserAgent,
+                userAgent: "akd/1.0 CFNetwork/808.1.4",
                 lookupURL: Constants.Anisette.URLs.grandSlamLookup,
                 requiredLibraries: Constants.Anisette.Libraries.requiredNames,
                 libraryDirectoryResolver: { libDir }
