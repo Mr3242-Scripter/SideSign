@@ -317,12 +317,36 @@ public extension DeveloperPortal {
         request.httpMethod = "POST"
         request.httpBody = plistData
 
-        // SideInstaller base_headers parity (Windows GSA / akd clientInfo path)
+        // SideInstaller base_headers parity (Windows GSA / akd)
+        // Prefer anisette identity UA; never send Macintosh/Xcode (Apple 503s those).
+        let windowsClientInfo = "<PC> <Windows;6.2(0,0);9200> <com.apple.AuthKit/1 (com.apple.iTunes/12.12.4.1)>"
+        let akdUserAgent = "akd/1.0 CFNetwork/808.1.4"
+        var clientInfo = anisetteData.clientInfo.trimmingCharacters(in: .whitespacesAndNewlines)
+        if clientInfo.isEmpty
+            || clientInfo.contains("MacBook")
+            || clientInfo.contains("macOS")
+            || clientInfo.contains("Mac OS")
+            || clientInfo.contains("<Android;")
+            || clientInfo.contains("Xcode") {
+            clientInfo = windowsClientInfo
+        }
+        var userAgent = anisetteData.userAgent.trimmingCharacters(in: .whitespacesAndNewlines)
+        if userAgent.isEmpty {
+            userAgent = h.grandSlam.userAgent.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if userAgent.isEmpty
+            || userAgent.contains("Macintosh")
+            || userAgent.contains("Mac OS")
+            || userAgent.contains("Xcode")
+            || userAgent.contains("AuthKit/1 (Macintosh") {
+            userAgent = akdUserAgent
+        }
+
         let headers: [String: String] = [
             "Content-Type": "text/x-xml-plist",
             "Accept": "text/x-xml-plist",
-            "X-MMe-Client-Info": anisetteData.clientInfo,
-            "User-Agent": h.grandSlam.userAgent,
+            "X-MMe-Client-Info": clientInfo,
+            "User-Agent": userAgent,
             "X-Xcode-Version": "14.2 (14C18)",
             "X-Apple-App-Info": "com.apple.gs.xcode.auth",
             "Connection": "close"
@@ -333,7 +357,7 @@ public extension DeveloperPortal {
             verboseLog("[SideSign] sendAuthenticationRequest HTTP headers: \(prettyJSONString(from: sanitizeHeadersForLogging(allHeaders)))")
         }
 
-        // SideInstaller: retry HTTP 429 with spaced backoff
+        // SideInstaller: retry HTTP 429 / 503 with spaced backoff
         let retryDelays: [UInt64] = [2_000_000_000, 5_000_000_000] // 2s, 5s
         var data = Data()
         var response: URLResponse = URLResponse()
@@ -348,9 +372,10 @@ public extension DeveloperPortal {
             }
             let httpResponse = response as? HTTPURLResponse
             statusCode = httpResponse?.statusCode ?? 0
-            if statusCode == HTTPStatusCodes.tooManyRequests, attempt < retryDelays.count {
+            let retryable = statusCode == HTTPStatusCodes.tooManyRequests || statusCode == 503
+            if retryable, attempt < retryDelays.count {
                 let delay = retryDelays[attempt]
-                debugLog("[SideSign] GrandSlam HTTP 429 — retrying in \(delay / 1_000_000_000)s (attempt \(attempt + 1))")
+                debugLog("[SideSign] GrandSlam HTTP \(statusCode) — retrying in \(delay / 1_000_000_000)s (attempt \(attempt + 1))")
                 try await Task.sleep(nanoseconds: delay)
                 attempt += 1
                 continue
