@@ -732,9 +732,8 @@ public extension DeveloperPortal {
             verboseLog("[SideSign] sendTrustedDevice2FACodeRequest HTTP headers: \(prettyJSONString(from: sanitizeHeadersForLogging(allHeaders)))")
         }
 
-        let (data, response) = try await session.data(for: request)
-        let httpResponse = response as? HTTPURLResponse
-        let statusCode = httpResponse?.safeStatusCode ?? 0
+        let (data, httpResponse) = try await performTwoFactorRequest(request, context: context, actionName: "sendTrustedDevice2FACodeRequest")
+        let statusCode = httpResponse.safeStatusCode
         try throwIfXMLUIErrorAlert(in: data, statusCode: statusCode, actionName: "sendTrustedDevice2FACodeRequest")
 
         guard statusCode == HTTPStatusCodes.ok else {
@@ -774,9 +773,8 @@ public extension DeveloperPortal {
             verboseLog("[SideSign] sendPhone2FACodeRequest HTTP headers: \(prettyJSONString(from: sanitizeHeadersForLogging(allHeaders)))")
         }
 
-        let (data, response) = try await session.data(for: request)
-        let httpResponse = response as? HTTPURLResponse
-        let statusCode = httpResponse?.safeStatusCode ?? 0
+        let (data, httpResponse) = try await performTwoFactorRequest(request, context: context, actionName: "sendPhone2FACodeRequest")
+        let statusCode = httpResponse.safeStatusCode
 
         let rawStr = prettyJSONString(from: data)
         verboseLog("[SideSign] sendPhone2FACodeRequest raw response (HTTP \(statusCode)): \(rawStr)")
@@ -862,9 +860,8 @@ public extension DeveloperPortal {
         }
 
         debugLog("[SideSign] Verifying trusted device security code...")
-        let (verifyData, verifyResponse) = try await session.data(for: verifyRequest)
-        let verifyHttpResponse = verifyResponse as? HTTPURLResponse
-        let verifyStatusCode = verifyHttpResponse?.safeStatusCode ?? 0
+        let (verifyData, verifyHttpResponse) = try await performTwoFactorRequest(verifyRequest, context: context, actionName: "validate2FACode")
+        let verifyStatusCode = verifyHttpResponse.safeStatusCode
 
         return try parseTwoFactorAuthVerifyResponse(data: verifyData, statusCode: verifyStatusCode, requirePeToken: false, httpResponse: verifyHttpResponse)
     }
@@ -886,9 +883,8 @@ public extension DeveloperPortal {
         }
 
         debugLog("[SideSign] Verifying secondary security code...")
-        let (verifyData, verifyResponse) = try await session.data(for: verifyRequest)
-        let verifyHttpResponse = verifyResponse as? HTTPURLResponse
-        let verifyStatusCode = verifyHttpResponse?.safeStatusCode ?? 0
+        let (verifyData, verifyHttpResponse) = try await performTwoFactorRequest(verifyRequest, context: context, actionName: "validate2FACode")
+        let verifyStatusCode = verifyHttpResponse.safeStatusCode
 
         return try parseTwoFactorAuthVerifyResponse(data: verifyData, statusCode: verifyStatusCode, requirePeToken: true, httpResponse: verifyHttpResponse)
     }
@@ -950,25 +946,37 @@ public extension DeveloperPortal {
         return .success
     }
 
-    private func makeTwoFactorAuthRequest(url: URL, context: TwoFactorAuthContext) -> URLRequest {
+    /// SideInstaller MAC_CLIENT_INFO: gsa.apple.com/auth 2FA pages often return a bare 403
+    /// for the Windows client used on GrandSlam; retry those requests as a Mac.
+    private static let macClientInfoFor2FA =
+        "<Mac15,7> <macOS;27.0;26A5378j> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
+
+    private func makeTwoFactorAuthRequest(url: URL, context: TwoFactorAuthContext, asMac: Bool = false) -> URLRequest {
         let identityToken = "\(context.dsid):\(context.idmsToken)"
         let encodedIdentityToken = Data(identityToken.utf8).base64EncodedString()
 
         var request = URLRequest(url: url)
         let a = context.anisetteData
         let h = customHeaders
+        var ua = a.userAgent.trimmingCharacters(in: .whitespacesAndNewlines)
+        if ua.isEmpty || ua.contains("Macintosh") || ua.contains("Xcode") || ua.contains("Mac OS") {
+            ua = "akd/1.0 CFNetwork/808.1.4"
+        }
+        let clientInfo = asMac ? Self.macClientInfoFor2FA : (
+            a.clientInfo.isEmpty ? Self.macClientInfoFor2FA : a.clientInfo
+        )
         let headers: [String: String] = [
             "Accept": "application/x-buddyml",
             "Accept-Language": "en-us",
             "Content-Type": "application/x-plist",
-            "User-Agent": (a.userAgent.isEmpty || a.userAgent.contains("Macintosh") || a.userAgent.contains("Xcode") ? "akd/1.0 CFNetwork/808.1.4" : a.userAgent),
+            "User-Agent": ua,
             "X-Apple-App-Info": h.grandSlam.authApp,
             "X-Xcode-Version": context.xcodeVersion,
             "X-Apple-Identity-Token": encodedIdentityToken,
             "X-Apple-I-MD": a.oneTimePassword,
             "X-Apple-I-MD-M": a.machineID,
             "X-Mme-Device-Id": a.deviceID,
-            "X-Mme-Client-Info": a.clientInfo,
+            "X-Mme-Client-Info": clientInfo,
             "X-Apple-I-MD-LU": a.localUserID,
             "X-Apple-I-MD-RINFO": a.routingInfo,
             "X-Apple-I-SRL-NO": a.serialNumber,
@@ -979,6 +987,37 @@ public extension DeveloperPortal {
         ]
         headers.forEach { request.setValue($1, forHTTPHeaderField: $0) }
         return request
+    }
+
+    /// SideInstaller `send_auth`: on bare 403 for Windows client, retry as Mac.
+    private func performTwoFactorRequest(_ request: URLRequest, context: TwoFactorAuthContext, actionName: String) async throws -> (Data, HTTPURLResponse) {
+        var current = request
+        var triedMac = false
+        while true {
+            let (data, response) = try await session.data(for: current)
+            let http = response as? HTTPURLResponse
+            let status = http?.safeStatusCode ?? 0
+            let body = String(data: data, encoding: .utf8) ?? ""
+            // Bare 403 (no Apple serviceErrors) = page refused the client identity
+            let bare403 = status == 403 && !body.localizedCaseInsensitiveContains("serviceErrors")
+                && !body.localizedCaseInsensitiveContains(""ec"")
+            if bare403 && !triedMac {
+                debugLog("[SideSign] \(actionName) HTTP 403 for Windows client — retrying as Mac (SideInstaller parity)")
+                guard let url = current.url else {
+                    throw ServerError.badServerResponse(reason: "\(actionName) missing URL", jsonPayload: body)
+                }
+                var macRequest = makeTwoFactorAuthRequest(url: url, context: context, asMac: true)
+                macRequest.httpMethod = current.httpMethod
+                macRequest.httpBody = current.httpBody
+                current = macRequest
+                triedMac = true
+                continue
+            }
+            guard let http else {
+                throw ServerError.badServerResponse(reason: "\(actionName) non-HTTP response", jsonPayload: body)
+            }
+            return (data, http)
+        }
     }
 
     private func parsePlistOrJSON(_ data: Data) -> [String: any Sendable]? {
