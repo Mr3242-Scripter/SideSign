@@ -354,7 +354,7 @@ public extension DeveloperPortal {
         // SideInstaller: retry HTTP 429 / 503 with spaced backoff
         let retryDelays: [UInt64] = [2_000_000_000, 5_000_000_000] // 2s, 5s
         var data = Data()
-        var response: URLResponse = URLResponse()
+        var response: URLResponse = URLResponse(url: Constants.URLs.grandSlamAuth, mimeType: nil, expectedContentLength: 0, textEncodingName: nil)
         var statusCode = 0
         var attempt = 0
         while true {
@@ -703,7 +703,7 @@ public extension DeveloperPortal {
                             activeChannel = .trustedDevice
                             currentRequest = .trustedDevice(error: "Apple won't send a code by text or call to this sign-in, so it was sent to your Apple devices.")
                         } else {
-                            currentRequest = .sms(phoneNumbers: phoneNumbers, activeID: targetPhoneID ?? phoneNumbers.first?.id, error: msg)
+                            currentRequest = .sms(phoneNumbers: phoneNumbers, activeID: targetPhoneID ?? phoneNumbers.first?.id ?? "", error: msg)
                         }
                     }
 
@@ -727,7 +727,7 @@ public extension DeveloperPortal {
                             activeChannel = .trustedDevice
                             currentRequest = .trustedDevice(error: "Apple won't send a code by text or call to this sign-in, so it was sent to your Apple devices.")
                         } else {
-                            currentRequest = .voice(phoneNumbers: phoneNumbers, activeID: targetPhoneID ?? phoneNumbers.first?.id, error: msg)
+                            currentRequest = .voice(phoneNumbers: phoneNumbers, activeID: targetPhoneID ?? phoneNumbers.first?.id ?? "", error: msg)
                         }
                     }
 
