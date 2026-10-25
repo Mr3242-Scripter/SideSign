@@ -783,11 +783,17 @@ public extension DeveloperPortal {
 
         let (data, httpResponse) = try await performTwoFactorRequest(request, context: context, actionName: "sendTrustedDevice2FACodeRequest")
         let statusCode = httpResponse.safeStatusCode
-        // SideInstaller DEVICE_CODE_UNCONFIRMED: bare 403 still allows entering a code
-        if statusCode == 403 {
-            debugLog("[SideSign] Trusted-device request returned HTTP 403; continuing so user can enter a code if one arrived")
+        // SideInstaller DEVICE_CODE_UNCONFIRMED: 403 / iCloud still allow entering a code
+        let rawPreview = String(data: data, encoding: .utf8) ?? ""
+        let lowerPreview = rawPreview.lowercased()
+        if statusCode == 403 || statusCode == 401
+            || lowerPreview.contains("icloud")
+            || lowerPreview.contains("could not connect")
+        {
+            debugLog("[SideSign] Trusted-device request soft-fail (HTTP \(statusCode)); prompting for code if one arrived")
             return
         }
+        // Non-iCloud XMLUI alerts still throw
         try throwIfXMLUIErrorAlert(in: data, statusCode: statusCode, actionName: "sendTrustedDevice2FACodeRequest")
 
         guard statusCode == HTTPStatusCodes.ok else {
@@ -839,12 +845,43 @@ public extension DeveloperPortal {
         let rawStr = prettyJSONString(from: data)
         verboseLog("[SideSign] sendPhone2FACodeRequest raw response (HTTP \(statusCode)): \(rawStr)")
 
-        try throwIfXMLUIErrorAlert(in: data, statusCode: statusCode, actionName: "sendPhone2FACodeRequest")
+        // SideInstaller PHONE_CODE_REFUSED: Apple returns "Could not connect to iCloud" / bare 403
+        // on Mac-ADI phone 2FA. Surface a consistent error so handle2FA falls back to devices.
+        let (xmluiTitle, xmluiMessage) = parseXMLUIAlertMessage(from: data)
+        let alertCombined = [xmluiTitle, xmluiMessage]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: ": ")
+        let alertLower = alertCombined.lowercased()
+        if statusCode == 403
+            || alertLower.contains("icloud")
+            || alertLower.contains("could not connect")
+            || alertLower.contains("forbidden")
+        {
+            let msg = xmluiMessage ?? alertCombined
+            if !msg.isEmpty {
+                debugLog("[SideSign] sendPhone2FACodeRequest Apple refused phone code (HTTP \(statusCode)): \(msg)")
+            } else {
+                debugLog("[SideSign] sendPhone2FACodeRequest bare HTTP 403 — phone code refused")
+            }
+            throw DeveloperPortalError.invalid2FAResponse(cause: "Could not connect to iCloud")
+        }
+        if xmluiTitle != nil || xmluiMessage != nil {
+            debugLog("[SideSign] sendPhone2FACodeRequest alert from Apple (HTTP \(statusCode)): \(alertCombined)")
+            throw DeveloperPortalError.invalid2FAResponse(cause: xmluiMessage ?? alertCombined)
+        }
 
         let responseDict = parsePlistOrJSON(data)
         let errorCode = responseDict?["ec"] as? Int ?? 0
         let errorMsg = (responseDict?["em"] as? String)
                    ?? ((responseDict?["Status"] as? [String: any Sendable])?["em"] as? String)
+
+        // serviceErrors / em may also say Could not connect to iCloud
+        let emLower = (errorMsg ?? "").lowercased()
+        if emLower.contains("icloud") || emLower.contains("could not connect") {
+            debugLog("[SideSign] sendPhone2FACodeRequest service error iCloud refuse: \(errorMsg ?? "")")
+            throw DeveloperPortalError.invalid2FAResponse(cause: "Could not connect to iCloud")
+        }
 
         if errorCode == GrandSlamAuthErrorCodes.tooManyAttempts
             || errorCode == GrandSlamAuthErrorCodes.tooManyCodesRequested
@@ -863,6 +900,10 @@ public extension DeveloperPortal {
         guard statusCode == HTTPStatusCodes.ok else {
             let reason = errorMsg ?? HTTPStatusCodes.localizedDescription(for: statusCode)
             debugLog("[SideSign] sendPhone2FACodeRequest failed (HTTP \(statusCode)): \(reason)")
+            // 403 already handled above; any other non-OK still try to soft-signal iCloud-style refusals
+            if statusCode == 403 || statusCode == 401 {
+                throw DeveloperPortalError.invalid2FAResponse(cause: "Could not connect to iCloud")
+            }
             throw ServerError.badServerResponse(reason: reason, jsonPayload: rawStr)
         }
 
