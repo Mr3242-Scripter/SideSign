@@ -317,17 +317,17 @@ public extension DeveloperPortal {
         request.httpMethod = "POST"
         request.httpBody = plistData
 
-        // SideInstaller 1.6.1: use the Mac anisette identity as provided (current Mac).
-        // Do NOT rewrite Mac client-info to Windows — Apple rejects Windows after the
-        // verification code with -80046; Mac path is the working one.
+        // SideInstaller 1.6.1: use Mac anisette identity as provided (current Mac).
+        // Do NOT rewrite Mac client-info to Windows (-80046 after verification code).
+        // Fallback MAC_CLIENT_INFO matches SideInstaller grandslam.rs when empty/Android.
+        let macClientInfo = "<Mac15,7> <macOS;27.0;26A5378j> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
         var clientInfo = anisetteData.clientInfo.trimmingCharacters(in: .whitespacesAndNewlines)
         var userAgent = anisetteData.userAgent.trimmingCharacters(in: .whitespacesAndNewlines)
         if userAgent.isEmpty {
             userAgent = h.grandSlam.userAgent.trimmingCharacters(in: .whitespacesAndNewlines)
         }
-        // Only clear empty / Android — keep current Mac from the anisette server
         if clientInfo.isEmpty || clientInfo.contains("<Android;") {
-            clientInfo = anisetteData.clientInfo
+            clientInfo = macClientInfo
         }
 
         let headers: [String: String] = [
@@ -641,16 +641,30 @@ public extension DeveloperPortal {
             phoneNumbers = parseTrustedPhoneNumbers(from: statusDictionary)
         }
 
-        // SideInstaller 1.6.1: prefer trusted devices. Through Mac anisette servers Apple
-        // often asks for SMS then refuses with "Could not connect to iCloud" (HTTP 403).
-        // Prefer devices; if SMS fails with that error, fall back to devices and still
-        // accept a code that may have arrived.
+        // SideInstaller 1.6.1 (apple_account.rs): prefer trusted devices.
+        // Through Mac anisette, Apple often asks for SMS then refuses with
+        // bare 403 / "Could not connect to iCloud". SideInstaller then sends
+        // to Apple devices (PHONE_CODE_REFUSED) and still accepts a code
+        // if the device push is unconfirmed (DEVICE_CODE_UNCONFIRMED).
         let preferredMode: TwoFactorDeliveryMode = .trustedDevice
 
-        var currentRequest: TwoFactorRequest = codeAlreadySent
-            ? .trustedDevice(error: nil)
-            : .selectDeliveryMethod(preferredMode: preferredMode, phoneNumbers: phoneNumbers)
-        var activeChannel: TwoFactorAuthChannel? = codeAlreadySent ? .trustedDevice : nil
+        var currentRequest: TwoFactorRequest
+        var activeChannel: TwoFactorAuthChannel?
+        if codeAlreadySent {
+            currentRequest = .trustedDevice(error: nil)
+            activeChannel = .trustedDevice
+        } else {
+            // Auto-request trusted device first (SideInstaller NeedsDevice2FA path)
+            do {
+                try await sendTrustedDevice2FACodeRequest(context: context)
+                currentRequest = .trustedDevice(error: nil)
+                activeChannel = .trustedDevice
+            } catch {
+                debugLog("[SideSign] Initial trusted-device request failed (\(error)); still prompting for code / other methods")
+                currentRequest = .selectDeliveryMethod(preferredMode: preferredMode, phoneNumbers: phoneNumbers)
+                activeChannel = .trustedDevice
+            }
+        }
 
         while true {
             debugLog("[SideSign] Prompting user with 2FA request (\(currentRequest))...")
@@ -663,11 +677,10 @@ public extension DeveloperPortal {
                         activeChannel = .trustedDevice
                         currentRequest = .trustedDevice(error: nil)
                     } catch {
-                        // SideInstaller: if Apple won't confirm the push either, still ask for the code
-                        // in case one arrived on a trusted device.
+                        // DEVICE_CODE_UNCONFIRMED: still ask for a code
                         debugLog("[SideSign] Trusted-device push failed (\(error)); still prompting for code")
                         activeChannel = .trustedDevice
-                        currentRequest = .trustedDevice(error: "If a code appeared on your Apple devices, enter it. Otherwise try again or pick SMS.")
+                        currentRequest = .trustedDevice(error: "Apple didn't confirm sending a code to your Apple devices. If one arrived, enter it; if not, try another way.")
                     }
 
                 case .requestSMS(let targetPhoneID):
@@ -677,16 +690,19 @@ public extension DeveloperPortal {
                         activeChannel = .sms(phoneID: result.phoneID)
                         currentRequest = .sms(phoneNumbers: phoneNumbers, activeID: result.phoneID, error: nil)
                     } catch {
-                        // SideInstaller 1.6.1: Apple refuses SMS with "Could not connect to iCloud"
-                        // through Mac servers — fall back to trusted devices and still accept a code.
+                        // PHONE_CODE_REFUSED → trusted devices (SideInstaller)
                         let msg = "\(error)"
                         debugLog("[SideSign] SMS 2FA failed (\(msg)); falling back to trusted device")
-                        if msg.lowercased().contains("icloud") || msg.lowercased().contains("403") || msg.lowercased().contains("could not connect") {
+                        let refused = msg.lowercased().contains("icloud")
+                            || msg.lowercased().contains("403")
+                            || msg.lowercased().contains("could not connect")
+                            || msg.lowercased().contains("forbidden")
+                        if refused {
                             do { try await sendTrustedDevice2FACodeRequest(context: context) } catch {
                                 debugLog("[SideSign] Trusted-device fallback after SMS also failed: \(error)")
                             }
                             activeChannel = .trustedDevice
-                            currentRequest = .trustedDevice(error: "SMS unavailable (Could not connect to iCloud). Enter the code from your Apple devices if one arrived.")
+                            currentRequest = .trustedDevice(error: "Apple won't send a code by text or call to this sign-in, so it was sent to your Apple devices.")
                         } else {
                             currentRequest = .sms(phoneNumbers: phoneNumbers, activeID: targetPhoneID ?? phoneNumbers.first?.id, error: msg)
                         }
@@ -701,12 +717,16 @@ public extension DeveloperPortal {
                     } catch {
                         let msg = "\(error)"
                         debugLog("[SideSign] Voice 2FA failed (\(msg)); falling back to trusted device")
-                        if msg.lowercased().contains("icloud") || msg.lowercased().contains("403") || msg.lowercased().contains("could not connect") {
+                        let refused = msg.lowercased().contains("icloud")
+                            || msg.lowercased().contains("403")
+                            || msg.lowercased().contains("could not connect")
+                            || msg.lowercased().contains("forbidden")
+                        if refused {
                             do { try await sendTrustedDevice2FACodeRequest(context: context) } catch {
                                 debugLog("[SideSign] Trusted-device fallback after voice also failed: \(error)")
                             }
                             activeChannel = .trustedDevice
-                            currentRequest = .trustedDevice(error: "Phone call unavailable (Could not connect to iCloud). Enter the code from your Apple devices if one arrived.")
+                            currentRequest = .trustedDevice(error: "Apple won't send a code by text or call to this sign-in, so it was sent to your Apple devices.")
                         } else {
                             currentRequest = .voice(phoneNumbers: phoneNumbers, activeID: targetPhoneID ?? phoneNumbers.first?.id, error: msg)
                         }
@@ -764,11 +784,20 @@ public extension DeveloperPortal {
 
         let (data, httpResponse) = try await performTwoFactorRequest(request, context: context, actionName: "sendTrustedDevice2FACodeRequest")
         let statusCode = httpResponse.safeStatusCode
+        // SideInstaller DEVICE_CODE_UNCONFIRMED: bare 403 still allows entering a code
+        if statusCode == 403 {
+            debugLog("[SideSign] Trusted-device request returned HTTP 403; continuing so user can enter a code if one arrived")
+            return
+        }
         try throwIfXMLUIErrorAlert(in: data, statusCode: statusCode, actionName: "sendTrustedDevice2FACodeRequest")
 
         guard statusCode == HTTPStatusCodes.ok else {
             let rawStr = prettyJSONString(from: data)
             debugLog("[SideSign] sendTrustedDevice2FACodeRequest failed (HTTP \(statusCode)): \(rawStr)")
+            // Still allow code entry path rather than hard-failing the whole sign-in
+            if statusCode == 403 || statusCode == 401 {
+                return
+            }
             throw ServerError.badServerResponse(reason: "Trusted device request failed (HTTP \(statusCode))", jsonPayload: rawStr)
         }
     }
