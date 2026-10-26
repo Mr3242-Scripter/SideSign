@@ -219,31 +219,58 @@ public extension DeveloperPortal {
                     verificationHandler: verificationHandler,
                     codeAlreadySent: pushedCode
                 )
-                // SideInstaller: after 2FA, login again. Refresh client-info + client time
-                // so the post-code GrandSlam request isn't refused with HTTP 503.
-                var post2FAAnisette = anisetteData
-                let advertised = post2FAAnisette.clientInfo
-                if advertised.contains("10.12") || advertised.isEmpty || advertised.contains("Android") {
-                    post2FAAnisette.clientInfo = "<MacBookPro18,3> <macOS;26.6;25F84> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
-                    post2FAAnisette.userAgent = "AuthKit/1 (Macintosh; OS X 26.6) (com.apple.akd/1.0)"
-                }
-                // Fresh client time (ISO8601) — stale time contributes to 503 refusals
+                // SideInstaller: after 2FA, login again.
+                // HTTP 503 here is common — Apple rate-limits; also refuses if client
+                // flips mid-session. Retry with same device, then once as Windows
+                // (SideInstaller skips a device kind after two 503s and tries the other).
                 let formatter = ISO8601DateFormatter()
                 formatter.formatOptions = [.withInternetDateTime]
-                post2FAAnisette.clientTime = formatter.string(from: Date())
-                // Brief pause so Apple accepts the verified session before re-login
-                try await Task.sleep(nanoseconds: 1_500_000_000)
-                return try await PushedCodeState.$handled.withValue(PushedCodeState.handled || pushedCode) {
-                    try await authenticate(
-                        appleID: unsanitizedAppleID,
-                        password: password,
-                        anisetteData: post2FAAnisette,
-                        xcodeVersion: xcodeVersion,
-                        machinePassword: machinePassword,
-                        accountRepairHandler: accountRepairHandler,
-                        verificationHandler: verificationHandler
-                    )
+                let currentMac = "<MacBookPro18,3> <macOS;26.6;25F84> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
+                let currentMacUA = "AuthKit/1 (Macintosh; OS X 26.6) (com.apple.akd/1.0)"
+                let windowsCI = "<PC> <Windows;6.2(0,0);9200> <com.apple.AuthKit/1 (com.apple.iTunes/12.12.4.1)>"
+                let akdUA = "akd/1.0 CFNetwork/808.1.4"
+
+                var lastPost2FAError: Error?
+                // delays: 2s, 5s, 10s, 15s between attempts
+                let postDelays: [UInt64] = [2_000_000_000, 5_000_000_000, 10_000_000_000, 15_000_000_000]
+                for attempt in 0..<postDelays.count {
+                    var post2FAAnisette = anisetteData
+                    // Same device start-to-finish (SideInstaller 1.5+). Prefer CURRENT_MAC;
+                    // after two Mac 503s try Windows once.
+                    if attempt >= 2 {
+                        post2FAAnisette.clientInfo = windowsCI
+                        post2FAAnisette.userAgent = akdUA
+                        debugLog("[SideSign] Post-2FA attempt \(attempt + 1): trying Windows client after Mac 503s")
+                    } else {
+                        post2FAAnisette.clientInfo = currentMac
+                        post2FAAnisette.userAgent = currentMacUA
+                    }
+                    post2FAAnisette.clientTime = formatter.string(from: Date())
+                    try await Task.sleep(nanoseconds: postDelays[attempt])
+                    do {
+                        return try await PushedCodeState.$handled.withValue(PushedCodeState.handled || pushedCode) {
+                            try await authenticate(
+                                appleID: unsanitizedAppleID,
+                                password: password,
+                                anisetteData: post2FAAnisette,
+                                xcodeVersion: xcodeVersion,
+                                machinePassword: machinePassword,
+                                accountRepairHandler: accountRepairHandler,
+                                verificationHandler: verificationHandler
+                            )
+                        }
+                    } catch {
+                        let msg = "\(error)".lowercased()
+                        let is503 = msg.contains("503") || msg.contains("433") || msg.contains("temporar")
+                        debugLog("[SideSign] Post-2FA re-login attempt \(attempt + 1) failed: \(error)")
+                        if is503, attempt < postDelays.count - 1 {
+                            lastPost2FAError = error
+                            continue
+                        }
+                        throw error
+                    }
                 }
+                throw lastPost2FAError ?? ServerError.badServerResponse(reason: "Apple returned HTTP 503 after 2FA", jsonPayload: "")
 
             case "repair":
                 let directRepairURL = completeResponseDictionary["repairUrl"] as? String
