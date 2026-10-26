@@ -219,11 +219,25 @@ public extension DeveloperPortal {
                     verificationHandler: verificationHandler,
                     codeAlreadySent: pushedCode
                 )
+                // SideInstaller: after 2FA, login again. Refresh client-info + client time
+                // so the post-code GrandSlam request isn't refused with HTTP 503.
+                var post2FAAnisette = anisetteData
+                let advertised = post2FAAnisette.clientInfo
+                if advertised.contains("10.12") || advertised.isEmpty || advertised.contains("Android") {
+                    post2FAAnisette.clientInfo = "<MacBookPro18,3> <macOS;26.6;25F84> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
+                    post2FAAnisette.userAgent = "AuthKit/1 (Macintosh; OS X 26.6) (com.apple.akd/1.0)"
+                }
+                // Fresh client time (ISO8601) — stale time contributes to 503 refusals
+                let formatter = ISO8601DateFormatter()
+                formatter.formatOptions = [.withInternetDateTime]
+                post2FAAnisette.clientTime = formatter.string(from: Date())
+                // Brief pause so Apple accepts the verified session before re-login
+                try await Task.sleep(nanoseconds: 1_500_000_000)
                 return try await PushedCodeState.$handled.withValue(PushedCodeState.handled || pushedCode) {
                     try await authenticate(
                         appleID: unsanitizedAppleID,
                         password: password,
-                        anisetteData: anisetteData,
+                        anisetteData: post2FAAnisette,
                         xcodeVersion: xcodeVersion,
                         machinePassword: machinePassword,
                         accountRepairHandler: accountRepairHandler,
@@ -373,7 +387,7 @@ public extension DeveloperPortal {
         }
 
         // SideInstaller: retry HTTP 429 / 503 with spaced backoff
-        let retryDelays: [UInt64] = [2_000_000_000, 5_000_000_000] // 2s, 5s
+        let retryDelays: [UInt64] = [2_000_000_000, 5_000_000_000, 10_000_000_000, 15_000_000_000] // 2s, 5s, 10s, 15s — SideInstaller-style 503 backoff
         var data = Data()
         var response: URLResponse = URLResponse(url: Constants.URLs.grandSlamAuth, mimeType: nil, expectedContentLength: 0, textEncodingName: nil)
         var statusCode = 0
@@ -403,7 +417,7 @@ public extension DeveloperPortal {
             let rawStr = String(data: data, encoding: .utf8) ?? data.hexEncodedString()
             debugLog("[SideSign] GrandSlam still HTTP \(statusCode) after retries: \(rawStr.prefix(200))")
             throw ServerError.badServerResponse(
-                reason: "Apple sign-in refused the request (HTTP \(statusCode)). Try a Windows anisette server and sign in again.",
+                reason: "Apple returned HTTP \(statusCode) after 2FA (temporary refuse). Wait a minute, Reset adi.pb, use jkcoxson/Mac anisette, and try again.",
                 jsonPayload: rawStr
             )
         }
