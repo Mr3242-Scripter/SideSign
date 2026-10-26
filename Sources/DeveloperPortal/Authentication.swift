@@ -197,11 +197,14 @@ public extension DeveloperPortal {
            ?? ((statusDictionary?["hsc"] as? Int) == 409 ? "pushedCode" : nil)
         verboseLog("[SideSign] Authentication status type: \(authType ?? "nil")")
 
+        let locked = Self.resolveClientIdentity(from: anisetteData)
         let twoFactorAuthContext = TwoFactorAuthContext(
             dsid: dsid,
             idmsToken: idmsToken,
             anisetteData: anisetteData,
-            xcodeVersion: xcodeVersion
+            xcodeVersion: xcodeVersion,
+            lockedClientInfo: locked.clientInfo,
+            lockedUserAgent: locked.userAgent
         )
 
         switch authType {
@@ -219,36 +222,27 @@ public extension DeveloperPortal {
                     verificationHandler: verificationHandler,
                     codeAlreadySent: pushedCode
                 )
-                // SideInstaller: after 2FA, login again.
-                // HTTP 503 here is common — Apple rate-limits; also refuses if client
-                // flips mid-session. Retry with same device, then once as Windows
-                // (SideInstaller skips a device kind after two 503s and tries the other).
+                                // SideInstaller: same device start→finish. After 2FA, login again with the
+                // *exact* client identity used for password+2FA. Switching Mac↔Windows here
+                // makes Apple treat it as a new machine and answer HTTP 503.
                 let formatter = ISO8601DateFormatter()
                 formatter.formatOptions = [.withInternetDateTime]
-                let currentMac = "<MacBookPro18,3> <macOS;26.6;25F84> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
-                let currentMacUA = "AuthKit/1 (Macintosh; OS X 26.6) (com.apple.akd/1.0)"
-                let windowsCI = "<PC> <Windows;6.2(0,0);9200> <com.apple.AuthKit/1 (com.apple.iTunes/12.12.4.1)>"
-                let akdUA = "akd/1.0 CFNetwork/808.1.4"
-
                 var lastPost2FAError: Error?
-                // delays: 2s, 5s, 10s, 15s between attempts
-                let postDelays: [UInt64] = [2_000_000_000, 5_000_000_000, 10_000_000_000, 15_000_000_000]
+                let postDelays: [UInt64] = [
+                    3_000_000_000,   // 3s
+                    8_000_000_000,   // 8s
+                    15_000_000_000,  // 15s
+                    25_000_000_000,  // 25s
+                ]
                 for attempt in 0..<postDelays.count {
                     var post2FAAnisette = anisetteData
-                    // Same device start-to-finish (SideInstaller 1.5+). Prefer CURRENT_MAC;
-                    // after two Mac 503s try Windows once.
-                    if attempt >= 2 {
-                        post2FAAnisette.clientInfo = windowsCI
-                        post2FAAnisette.userAgent = akdUA
-                        debugLog("[SideSign] Post-2FA attempt \(attempt + 1): trying Windows client after Mac 503s")
-                    } else {
-                        post2FAAnisette.clientInfo = currentMac
-                        post2FAAnisette.userAgent = currentMacUA
-                    }
+                    post2FAAnisette.clientInfo = twoFactorAuthContext.lockedClientInfo
+                    post2FAAnisette.userAgent = twoFactorAuthContext.lockedUserAgent
                     post2FAAnisette.clientTime = formatter.string(from: Date())
+                    debugLog("[SideSign] Post-2FA re-login attempt \(attempt + 1)/\(postDelays.count) client=\(post2FAAnisette.clientInfo.prefix(40))...")
                     try await Task.sleep(nanoseconds: postDelays[attempt])
                     do {
-                        return try await PushedCodeState.$handled.withValue(PushedCodeState.handled || pushedCode) {
+                        return try await PushedCodeState.$handled.withValue(true) {
                             try await authenticate(
                                 appleID: unsanitizedAppleID,
                                 password: password,
@@ -261,16 +255,24 @@ public extension DeveloperPortal {
                         }
                     } catch {
                         let msg = "\(error)".lowercased()
-                        let is503 = msg.contains("503") || msg.contains("433") || msg.contains("temporar")
+                        let is503 = msg.contains("503") || msg.contains("433")
                         debugLog("[SideSign] Post-2FA re-login attempt \(attempt + 1) failed: \(error)")
                         if is503, attempt < postDelays.count - 1 {
                             lastPost2FAError = error
                             continue
                         }
+                        // If Apple asks for 2FA again after we already verified, treat as success path failure
+                        if msg.contains("twofactor") || msg.contains("2fa") || msg.contains("verification") {
+                            lastPost2FAError = error
+                            if attempt < postDelays.count - 1 { continue }
+                        }
                         throw error
                     }
                 }
-                throw lastPost2FAError ?? ServerError.badServerResponse(reason: "Apple returned HTTP 503 after 2FA", jsonPayload: "")
+                throw lastPost2FAError ?? ServerError.badServerResponse(
+                    reason: "Apple returned HTTP 503 after 2FA. Wait 5 minutes, Reset adi.pb, try once more.",
+                    jsonPayload: ""
+                )
 
             case "repair":
                 let directRepairURL = completeResponseDictionary["repairUrl"] as? String
@@ -672,6 +674,9 @@ public extension DeveloperPortal {
         let idmsToken: String
         let anisetteData: AnisetteData
         let xcodeVersion: String
+        /// SideInstaller: same device from start to finish — locked at first GrandSlam request
+        let lockedClientInfo: String
+        let lockedUserAgent: String
     }
 
     private struct TwoFactorAuthPhoneCodeResponse {
@@ -1098,6 +1103,25 @@ public extension DeveloperPortal {
 
     /// SideInstaller MAC_CLIENT_INFO: gsa.apple.com/auth 2FA pages often return a bare 403
     /// for the Windows client used on GrandSlam; retry those requests as a Mac.
+
+    /// SideInstaller client_info_to_use — one identity for the whole sign-in.
+    private static func resolveClientIdentity(from anisetteData: AnisetteData) -> (clientInfo: String, userAgent: String) {
+        let currentMac = "<MacBookPro18,3> <macOS;26.6;25F84> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
+        let currentMacUA = "AuthKit/1 (Macintosh; OS X 26.6) (com.apple.akd/1.0)"
+        let windows = "<PC> <Windows;6.2(0,0);9200> <com.apple.AuthKit/1 (com.apple.iTunes/12.12.4.1)>"
+        let akdUA = "akd/1.0 CFNetwork/808.1.4"
+        let advertised = anisetteData.clientInfo.trimmingCharacters(in: .whitespacesAndNewlines)
+        if advertised.isEmpty || advertised.contains("<Android;") {
+            return (windows, akdUA)
+        }
+        if advertised.contains("10.12") || advertised.contains("Mac OS X;10.11") || advertised.contains("Mac OS X;10.10") {
+            return (currentMac, currentMacUA)
+        }
+        var ua = anisetteData.userAgent.trimmingCharacters(in: .whitespacesAndNewlines)
+        if ua.isEmpty { ua = akdUA }
+        return (advertised, ua)
+    }
+
     private static let macClientInfoFor2FA =
         "<MacBookPro18,3> <macOS;26.6;25F84> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
 
@@ -1108,13 +1132,10 @@ public extension DeveloperPortal {
         var request = URLRequest(url: url)
         let a = context.anisetteData
         let h = customHeaders
-        var ua = a.userAgent.trimmingCharacters(in: .whitespacesAndNewlines)
-        if ua.isEmpty || ua.contains("Macintosh") || ua.contains("Xcode") || ua.contains("Mac OS") {
-            ua = "akd/1.0 CFNetwork/808.1.4"
-        }
-        let clientInfo = asMac ? Self.macClientInfoFor2FA : (
-            a.clientInfo.isEmpty ? Self.macClientInfoFor2FA : a.clientInfo
-        )
+        // SideInstaller: same device for GSA and 2FA pages (locked identity)
+        let resolved = Self.resolveClientIdentity(from: a)
+        let clientInfo = resolved.clientInfo
+        let ua = resolved.userAgent
         let headers: [String: String] = [
             "Accept": "application/x-buddyml",
             "Accept-Language": "en-us",
