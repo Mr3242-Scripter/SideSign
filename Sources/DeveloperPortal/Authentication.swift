@@ -317,23 +317,44 @@ public extension DeveloperPortal {
         request.httpMethod = "POST"
         request.httpBody = plistData
 
-        // SideInstaller 1.6.1 (grandslam.rs MAC_CLIENT_INFO):
-        // Remote Mac anisette servers still *name* macOS 10.12 / old MacBookPros.
-        // Apple rejects that after the verification code (-80046) or as too old (-23782).
-        // SideInstaller always reports a *current* Mac for GrandSlam headers.
-        let macClientInfo = "<Mac15,7> <macOS;27.0;26A5378j> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
+        // SideInstaller client_info_to_use (remote_v3/mod.rs) — exact:
+        // empty/Android → Windows; Mac older than 10.13 → CURRENT_MAC; else advertised.
+        // Wrong client after the SMS code is what causes -80046.
+        let windowsClientInfo = "<PC> <Windows;6.2(0,0);9200> <com.apple.AuthKit/1 (com.apple.iTunes/12.12.4.1)>"
+        let currentMacClientInfo = "<MacBookPro18,3> <macOS;26.6;25F84> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
+        let currentMacUserAgent = "AuthKit/1 (Macintosh; OS X 26.6) (com.apple.akd/1.0)"
         let akdUserAgent = "akd/1.0 CFNetwork/808.1.4"
-        let clientInfo = macClientInfo
-        var userAgent = anisetteData.userAgent.trimmingCharacters(in: .whitespacesAndNewlines)
-        if userAgent.isEmpty {
-            userAgent = h.grandSlam.userAgent.trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        if userAgent.isEmpty
-            || userAgent.contains("Macintosh")
-            || userAgent.contains("Mac OS")
-            || userAgent.contains("Xcode")
-            || userAgent.contains("AuthKit/1 (Macintosh") {
+        let advertised = anisetteData.clientInfo.trimmingCharacters(in: .whitespacesAndNewlines)
+        let clientInfo: String
+        let userAgent: String
+        if advertised.isEmpty || advertised.contains("<Android;") {
+            clientInfo = windowsClientInfo
             userAgent = akdUserAgent
+        } else if advertised.contains("Mac OS X;10.12")
+            || advertised.contains("macOS;10.12")
+            || advertised.contains("<Mac OS X;10.")
+            || (advertised.contains("Mac OS X;") && !advertised.contains("Mac OS X;10.13") && !advertised.contains("Mac OS X;10.14") && !advertised.contains("Mac OS X;10.15") && !advertised.contains("macOS;1"))
+            || advertised.contains("<macOS;10.12") {
+            // mac_version < (10, 13) → current Mac
+            clientInfo = currentMacClientInfo
+            userAgent = currentMacUserAgent
+        } else if advertised.contains("<macOS;") || advertised.contains("<Mac OS X;") || advertised.contains("MacBook") || advertised.contains("<Mac") {
+            // Mac 10.13+ — keep advertised (or still upgrade ancient strings)
+            if advertised.contains("10.12") {
+                clientInfo = currentMacClientInfo
+                userAgent = currentMacUserAgent
+            } else {
+                clientInfo = advertised
+                var ua = anisetteData.userAgent.trimmingCharacters(in: .whitespacesAndNewlines)
+                if ua.isEmpty { ua = akdUserAgent }
+                userAgent = ua
+            }
+        } else if advertised.contains("<PC>") || advertised.contains("Windows") {
+            clientInfo = advertised.isEmpty ? windowsClientInfo : advertised
+            userAgent = akdUserAgent
+        } else {
+            clientInfo = currentMacClientInfo
+            userAgent = currentMacUserAgent
         }
 
         let headers: [String: String] = [
@@ -1037,7 +1058,7 @@ public extension DeveloperPortal {
     /// SideInstaller MAC_CLIENT_INFO: gsa.apple.com/auth 2FA pages often return a bare 403
     /// for the Windows client used on GrandSlam; retry those requests as a Mac.
     private static let macClientInfoFor2FA =
-        "<Mac15,7> <macOS;27.0;26A5378j> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
+        "<MacBookPro18,3> <macOS;26.6;25F84> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
 
     private func makeTwoFactorAuthRequest(url: URL, context: TwoFactorAuthContext, asMac: Bool = false) -> URLRequest {
         let identityToken = "\(context.dsid):\(context.idmsToken)"
