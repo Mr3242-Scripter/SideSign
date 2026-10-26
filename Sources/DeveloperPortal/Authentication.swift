@@ -690,21 +690,14 @@ public extension DeveloperPortal {
                         activeChannel = .sms(phoneID: result.phoneID)
                         currentRequest = .sms(phoneNumbers: phoneNumbers, activeID: result.phoneID, error: nil)
                     } catch {
+                        // SideInstaller PHONE_CODE_REFUSED: 403 / 423 / iCloud / any phone failure → devices
                         let msg = "\(error)"
                         debugLog("[SideSign] SMS 2FA failed (\(msg)); falling back to trusted device")
-                        let refused = msg.lowercased().contains("icloud")
-                            || msg.lowercased().contains("403")
-                            || msg.lowercased().contains("could not connect")
-                            || msg.lowercased().contains("forbidden")
-                        if refused {
-                            do { try await sendTrustedDevice2FACodeRequest(context: context) } catch {
-                                debugLog("[SideSign] Trusted-device fallback after SMS also failed: \(error)")
-                            }
-                            activeChannel = .trustedDevice
-                            currentRequest = .trustedDevice(error: "Apple won't send a code by text or call to this sign-in, so it was sent to your Apple devices.")
-                        } else {
-                            currentRequest = .sms(phoneNumbers: phoneNumbers, activeID: targetPhoneID ?? phoneNumbers.first?.id ?? "", error: msg)
+                        do { try await sendTrustedDevice2FACodeRequest(context: context) } catch {
+                            debugLog("[SideSign] Trusted-device fallback after SMS also failed: \(error)")
                         }
+                        activeChannel = .trustedDevice
+                        currentRequest = .trustedDevice(error: "Apple won't send a code by text or call to this sign-in, so it was sent to your Apple devices. Enter the code from your devices if one arrived.")
                     }
 
                 case .requestVoice(let targetPhoneID):
@@ -716,19 +709,11 @@ public extension DeveloperPortal {
                     } catch {
                         let msg = "\(error)"
                         debugLog("[SideSign] Voice 2FA failed (\(msg)); falling back to trusted device")
-                        let refused = msg.lowercased().contains("icloud")
-                            || msg.lowercased().contains("403")
-                            || msg.lowercased().contains("could not connect")
-                            || msg.lowercased().contains("forbidden")
-                        if refused {
-                            do { try await sendTrustedDevice2FACodeRequest(context: context) } catch {
-                                debugLog("[SideSign] Trusted-device fallback after voice also failed: \(error)")
-                            }
-                            activeChannel = .trustedDevice
-                            currentRequest = .trustedDevice(error: "Apple won't send a code by text or call to this sign-in, so it was sent to your Apple devices.")
-                        } else {
-                            currentRequest = .voice(phoneNumbers: phoneNumbers, activeID: targetPhoneID ?? phoneNumbers.first?.id ?? "", error: msg)
+                        do { try await sendTrustedDevice2FACodeRequest(context: context) } catch {
+                            debugLog("[SideSign] Trusted-device fallback after voice also failed: \(error)")
                         }
+                        activeChannel = .trustedDevice
+                        currentRequest = .trustedDevice(error: "Apple won't send a code by text or call to this sign-in, so it was sent to your Apple devices. Enter the code from your devices if one arrived.")
                     }
 
                 case .verificationCode(let code):
@@ -901,10 +886,12 @@ public extension DeveloperPortal {
             let reason = errorMsg ?? HTTPStatusCodes.localizedDescription(for: statusCode)
             debugLog("[SideSign] sendPhone2FACodeRequest failed (HTTP \(statusCode)): \(reason)")
             // 403 already handled above; any other non-OK still try to soft-signal iCloud-style refusals
-            if statusCode == 403 || statusCode == 401 {
+            // 423 Locked = phone method locked (same as SideInstaller PHONE_CODE_REFUSED)
+            if statusCode == 403 || statusCode == 401 || statusCode == 423 {
                 throw DeveloperPortalError.invalid2FAResponse(cause: "Could not connect to iCloud")
             }
-            throw ServerError.badServerResponse(reason: reason, jsonPayload: rawStr)
+            // Any non-OK phone response → treat as phone refused so UI falls back to devices
+            throw DeveloperPortalError.invalid2FAResponse(cause: "Could not connect to iCloud (HTTP \(statusCode))")
         }
 
         var parsedNumbers = parseTrustedPhoneNumbers(from: responseDict)
