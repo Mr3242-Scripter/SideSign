@@ -364,8 +364,8 @@ public extension DeveloperPortal {
         // empty/Android → Windows; Mac older than 10.13 → CURRENT_MAC; else advertised.
         // Wrong client after the SMS code is what causes -80046.
         let windowsClientInfo = "<PC> <Windows;6.2(0,0);9200> <com.apple.AuthKit/1 (com.apple.iTunes/12.12.4.1)>"
-        let currentMacClientInfo = "<MacBookPro18,3> <macOS;26.6;25F84> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
-        let currentMacUserAgent = "AuthKit/1 (Macintosh; OS X 26.6) (com.apple.akd/1.0)"
+        let currentMacClientInfo = "<Mac15,7> <macOS;27.0;26A5378j> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
+        let currentMacUserAgent = "AuthKit/1 (Macintosh; OS X 27.0) (com.apple.akd/1.0)"
         let akdUserAgent = "akd/1.0 CFNetwork/808.1.4"
         let advertised = anisetteData.clientInfo.trimmingCharacters(in: .whitespacesAndNewlines)
         let clientInfo: String
@@ -714,8 +714,12 @@ public extension DeveloperPortal {
             phoneNumbers = parseTrustedPhoneNumbers(from: statusDictionary)
         }
 
-        // SideInstaller 1.6.1: prefer trusted devices (PHONE_CODE_REFUSED → devices)
+        // SideInstaller 1.6.1: ALWAYS start on trusted devices.
+        // Apple locks SMS/voice → "Could not connect to iCloud"; never surface that
+        // to the user — stay on the device-code prompt (PHONE_CODE_REFUSED → devices).
         let preferredMode: TwoFactorDeliveryMode = .trustedDevice
+        let phoneCodeRefusedMessage = "Apple won't send a code by text or call to this sign-in, so it was sent to your Apple devices."
+        let deviceCodeUnconfirmedMessage = "Apple didn't confirm sending a code to your Apple devices. If one arrived, enter it; if not, try another way."
 
         var currentRequest: TwoFactorRequest
         var activeChannel: TwoFactorAuthChannel?
@@ -728,8 +732,9 @@ public extension DeveloperPortal {
                 currentRequest = .trustedDevice(error: nil)
                 activeChannel = .trustedDevice
             } catch {
-                debugLog("[SideSign] Initial trusted-device request failed (\(error)); prompting with preferred device mode")
-                currentRequest = .selectDeliveryMethod(preferredMode: preferredMode, phoneNumbers: phoneNumbers)
+                // Soft-fail: still show device code field (SideInstaller DEVICE_CODE_UNCONFIRMED)
+                debugLog("[SideSign] Initial trusted-device request failed (\(error)); still prompting for device code")
+                currentRequest = .trustedDevice(error: deviceCodeUnconfirmedMessage)
                 activeChannel = .trustedDevice
             }
         }
@@ -747,7 +752,7 @@ public extension DeveloperPortal {
                     } catch {
                         debugLog("[SideSign] Trusted-device push failed (\(error)); still prompting for code")
                         activeChannel = .trustedDevice
-                        currentRequest = .trustedDevice(error: "Apple didn't confirm sending a code to your Apple devices. If one arrived, enter it; if not, try another way.")
+                        currentRequest = .trustedDevice(error: deviceCodeUnconfirmedMessage)
                     }
 
                 case .requestSMS(let targetPhoneID):
@@ -764,7 +769,7 @@ public extension DeveloperPortal {
                             debugLog("[SideSign] Trusted-device fallback after SMS also failed: \(error)")
                         }
                         activeChannel = .trustedDevice
-                        currentRequest = .trustedDevice(error: "Apple won't send a code by text or call to this sign-in, so it was sent to your Apple devices. Enter the code from your devices if one arrived.")
+                        currentRequest = .trustedDevice(error: phoneCodeRefusedMessage)
                     }
 
                 case .requestVoice(let targetPhoneID):
@@ -780,7 +785,7 @@ public extension DeveloperPortal {
                             debugLog("[SideSign] Trusted-device fallback after voice also failed: \(error)")
                         }
                         activeChannel = .trustedDevice
-                        currentRequest = .trustedDevice(error: "Apple won't send a code by text or call to this sign-in, so it was sent to your Apple devices. Enter the code from your devices if one arrived.")
+                        currentRequest = .trustedDevice(error: phoneCodeRefusedMessage)
                     }
 
                 case .verificationCode(let code):
@@ -916,7 +921,7 @@ public extension DeveloperPortal {
             } else {
                 debugLog("[SideSign] sendPhone2FACodeRequest bare HTTP 403 — phone code refused")
             }
-            throw DeveloperPortalError.invalid2FAResponse(cause: "Could not connect to iCloud")
+            throw DeveloperPortalError.invalid2FAResponse(cause: "PHONE_CODE_REFUSED")
         }
         if xmluiTitle != nil || xmluiMessage != nil {
             debugLog("[SideSign] sendPhone2FACodeRequest alert from Apple (HTTP \(statusCode)): \(alertCombined)")
@@ -932,7 +937,7 @@ public extension DeveloperPortal {
         let emLower = (errorMsg ?? "").lowercased()
         if emLower.contains("icloud") || emLower.contains("could not connect") {
             debugLog("[SideSign] sendPhone2FACodeRequest service error iCloud refuse: \(errorMsg ?? "")")
-            throw DeveloperPortalError.invalid2FAResponse(cause: "Could not connect to iCloud")
+            throw DeveloperPortalError.invalid2FAResponse(cause: "PHONE_CODE_REFUSED")
         }
 
         if errorCode == GrandSlamAuthErrorCodes.tooManyAttempts
@@ -955,10 +960,10 @@ public extension DeveloperPortal {
             // 403 already handled above; any other non-OK still try to soft-signal iCloud-style refusals
             // 423 Locked = phone method locked (same as SideInstaller PHONE_CODE_REFUSED)
             if statusCode == 403 || statusCode == 401 || statusCode == 423 {
-                throw DeveloperPortalError.invalid2FAResponse(cause: "Could not connect to iCloud")
+                throw DeveloperPortalError.invalid2FAResponse(cause: "PHONE_CODE_REFUSED")
             }
             // Any non-OK phone response → treat as phone refused so UI falls back to devices
-            throw DeveloperPortalError.invalid2FAResponse(cause: "Could not connect to iCloud (HTTP \(statusCode))")
+            throw DeveloperPortalError.invalid2FAResponse(cause: "PHONE_CODE_REFUSED")
         }
 
         var parsedNumbers = parseTrustedPhoneNumbers(from: responseDict)
@@ -1106,14 +1111,16 @@ public extension DeveloperPortal {
 
     /// SideInstaller client_info_to_use — one identity for the whole sign-in.
     private static func resolveClientIdentity(from anisetteData: AnisetteData) -> (clientInfo: String, userAgent: String) {
-        let currentMac = "<MacBookPro18,3> <macOS;26.6;25F84> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
-        let currentMacUA = "AuthKit/1 (Macintosh; OS X 26.6) (com.apple.akd/1.0)"
+        // SideInstaller client_info_to_use + MAC_CLIENT_INFO (grandslam.rs)
+        let currentMac = "<Mac15,7> <macOS;27.0;26A5378j> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
+        let currentMacUA = "AuthKit/1 (Macintosh; OS X 27.0) (com.apple.akd/1.0)"
         let windows = "<PC> <Windows;6.2(0,0);9200> <com.apple.AuthKit/1 (com.apple.iTunes/12.12.4.1)>"
         let akdUA = "akd/1.0 CFNetwork/808.1.4"
         let advertised = anisetteData.clientInfo.trimmingCharacters(in: .whitespacesAndNewlines)
         if advertised.isEmpty || advertised.contains("<Android;") {
             return (windows, akdUA)
         }
+        // Mac older than 10.13 (servers still name 10.12.6) → current Mac
         if advertised.contains("10.12") || advertised.contains("Mac OS X;10.11") || advertised.contains("Mac OS X;10.10") {
             return (currentMac, currentMacUA)
         }
@@ -1122,8 +1129,7 @@ public extension DeveloperPortal {
         return (advertised, ua)
     }
 
-    private static let macClientInfoFor2FA =
-        "<MacBookPro18,3> <macOS;26.6;25F84> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
+    private static let macClientInfoFor2FA = "<Mac15,7> <macOS;27.0;26A5378j> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
 
     private func makeTwoFactorAuthRequest(url: URL, context: TwoFactorAuthContext, asMac: Bool = false) -> URLRequest {
         let identityToken = "\(context.dsid):\(context.idmsToken)"
