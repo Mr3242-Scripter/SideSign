@@ -222,25 +222,41 @@ public extension DeveloperPortal {
                     verificationHandler: verificationHandler,
                     codeAlreadySent: pushedCode
                 )
-                                // SideInstaller: same device start→finish. After 2FA, login again with the
-                // *exact* client identity used for password+2FA. Switching Mac↔Windows here
-                // makes Apple treat it as a new machine and answer HTTP 503.
+                                // SideInstaller: after 2FA, get fresh anisette (new OTP) then login again
+                // with the *same* locked client identity. Stale X-Apple-I-MD after SMS
+                // is a common cause of GrandSlam HTTP 503.
                 let formatter = ISO8601DateFormatter()
                 formatter.formatOptions = [.withInternetDateTime]
+                let lockedCI = twoFactorAuthContext.lockedClientInfo
+                let lockedUA = twoFactorAuthContext.lockedUserAgent
+
+                // Brief pause so Apple accepts the verified 2FA session
+                try await Task.sleep(nanoseconds: 2_000_000_000)
+
                 var lastPost2FAError: Error?
                 let postDelays: [UInt64] = [
-                    3_000_000_000,   // 3s
-                    8_000_000_000,   // 8s
-                    15_000_000_000,  // 15s
-                    25_000_000_000,  // 25s
+                    2_000_000_000,   // 2s
+                    5_000_000_000,   // 5s
+                    10_000_000_000,  // 10s
+                    20_000_000_000,  // 20s
                 ]
                 for attempt in 0..<postDelays.count {
-                    var post2FAAnisette = anisetteData
-                    post2FAAnisette.clientInfo = twoFactorAuthContext.lockedClientInfo
-                    post2FAAnisette.userAgent = twoFactorAuthContext.lockedUserAgent
+                    if attempt > 0 {
+                        try await Task.sleep(nanoseconds: postDelays[attempt])
+                    }
+
+                    // Refresh anisette OTP like SideInstaller get_anisette_data() before login again
+                    var post2FAAnisette = await Self.refreshAnisetteAfter2FA(
+                        original: anisetteData,
+                        lockedClientInfo: lockedCI,
+                        lockedUserAgent: lockedUA
+                    )
+                    post2FAAnisette.clientInfo = lockedCI
+                    post2FAAnisette.userAgent = lockedUA
                     post2FAAnisette.clientTime = formatter.string(from: Date())
-                    debugLog("[SideSign] Post-2FA re-login attempt \(attempt + 1)/\(postDelays.count) client=\(post2FAAnisette.clientInfo.prefix(40))...")
-                    try await Task.sleep(nanoseconds: postDelays[attempt])
+
+                    debugLog("[SideSign] Post-2FA re-login attempt \(attempt + 1)/\(postDelays.count) otpLen=\(post2FAAnisette.oneTimePassword.count) client=\(post2FAAnisette.clientInfo.prefix(48))...")
+
                     do {
                         return try await PushedCodeState.$handled.withValue(true) {
                             try await authenticate(
@@ -255,22 +271,26 @@ public extension DeveloperPortal {
                         }
                     } catch {
                         let msg = "\(error)".lowercased()
-                        let is503 = msg.contains("503") || msg.contains("433")
+                        let is503 = msg.contains("503") || msg.contains("433") || msg.contains("temporar")
                         debugLog("[SideSign] Post-2FA re-login attempt \(attempt + 1) failed: \(error)")
                         if is503, attempt < postDelays.count - 1 {
                             lastPost2FAError = error
+                            // Force next attempt to clear anisette cache
+                            AnisetteDataManager.shared.clearCache()
                             continue
                         }
-                        // If Apple asks for 2FA again after we already verified, treat as success path failure
                         if msg.contains("twofactor") || msg.contains("2fa") || msg.contains("verification") {
                             lastPost2FAError = error
-                            if attempt < postDelays.count - 1 { continue }
+                            if attempt < postDelays.count - 1 {
+                                AnisetteDataManager.shared.clearCache()
+                                continue
+                            }
                         }
                         throw error
                     }
                 }
                 throw lastPost2FAError ?? ServerError.badServerResponse(
-                    reason: "Apple returned HTTP 503 after 2FA. Wait 5 minutes, Reset adi.pb, try once more.",
+                    reason: "Apple returned HTTP 503 after 2FA. Wait several minutes, Reset adi.pb, try once.",
                     jsonPayload: ""
                 )
 
@@ -1149,6 +1169,68 @@ public extension DeveloperPortal {
     /// for the Windows client used on GrandSlam; retry those requests as a Mac.
 
     /// SideInstaller client_info_to_use — one identity for the whole sign-in.
+    
+    /// SideInstaller calls `get_anisette_data` again before "login again" after 2FA.
+    /// Fresh OTP (X-Apple-I-MD) avoids GrandSlam HTTP 503 on the post-code SRP.
+    private static func refreshAnisetteAfter2FA(
+        original: AnisetteData,
+        lockedClientInfo: String,
+        lockedUserAgent: String
+    ) async -> AnisetteData {
+        AnisetteDataManager.shared.clearCache()
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+
+        // Prefer activeMode; else SideStore's menuAnisetteURL (UserDefaults)
+        let mode: AnisetteMode? = AnisetteDataManager.shared.activeMode ?? {
+            let urlStr = UserDefaults.standard.string(forKey: "menuAnisetteURL")
+                ?? UserDefaults.standard.string(forKey: "defaultServerURL")
+                ?? ""
+            guard let url = URL(string: urlStr), !urlStr.isEmpty else { return nil }
+            return .remote(server: url)
+        }()
+
+        guard let mode else {
+            debugLog("[SideSign] Post-2FA anisette refresh: no server mode — keeping OTP, fresh clientTime only")
+            var copy = original
+            copy.clientInfo = lockedClientInfo
+            copy.userAgent = lockedUserAgent
+            copy.clientTime = formatter.string(from: Date())
+            return copy
+        }
+
+        let identifier = UUID(uuidString: original.deviceID) ?? UUID()
+        var requestHeaders = original.toRequestHeaders()
+        requestHeaders.clientInfo = lockedClientInfo
+        requestHeaders.userAgent = lockedUserAgent
+        requestHeaders.clientTime = formatter.string(from: Date())
+
+        do {
+            let (fresh, _) = try await AnisetteDataManager.shared.fetchAnisetteData(
+                mode: mode,
+                identifier: identifier,
+                existingAdiBlob: nil,
+                headers: requestHeaders
+            )
+            var result = fresh
+            result.clientInfo = lockedClientInfo
+            result.userAgent = lockedUserAgent
+            result.clientTime = formatter.string(from: Date())
+            if result.deviceID.isEmpty { result.deviceID = original.deviceID }
+            if result.machineID.isEmpty { result.machineID = original.machineID }
+            debugLog("[SideSign] Post-2FA anisette refresh OK (new OTP)")
+            return result
+        } catch {
+            debugLog("[SideSign] Post-2FA anisette refresh failed (\(error)); using prior headers + new clientTime")
+            var copy = original
+            copy.clientInfo = lockedClientInfo
+            copy.userAgent = lockedUserAgent
+            copy.clientTime = formatter.string(from: Date())
+            return copy
+        }
+    }
+
+
     private static func resolveClientIdentity(from anisetteData: AnisetteData) -> (clientInfo: String, userAgent: String) {
         // SideInstaller remote_v3::client_info_to_use — exact
         let currentMac = "<MacBookPro18,3> <macOS;26.6;25F84> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
