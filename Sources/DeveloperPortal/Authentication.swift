@@ -380,68 +380,67 @@ public extension DeveloperPortal {
         request.httpMethod = "POST"
         request.httpBody = plistData
 
-        // SideInstaller client_info_to_use (remote_v3/mod.rs) — exact:
-        // empty/Android → Windows; Mac older than 10.13 → CURRENT_MAC; else advertised.
-        // Wrong client after the SMS code is what causes -80046.
-        let windowsClientInfo = "<PC> <Windows;6.2(0,0);9200> <com.apple.AuthKit/1 (com.apple.iTunes/12.12.4.1)>"
-        let currentMacClientInfo = "<MacBookPro18,3> <macOS;26.6;25F84> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
-        let currentMacUserAgent = "AuthKit/1 (Macintosh; OS X 26.6) (com.apple.akd/1.0)"
-        let akdUserAgent = "akd/1.0 CFNetwork/808.1.4"
-        let advertised = anisetteData.clientInfo.trimmingCharacters(in: .whitespacesAndNewlines)
-        let clientInfo: String
-        let userAgent: String
-        if advertised.isEmpty || advertised.contains("<Android;") {
-            clientInfo = windowsClientInfo
-            userAgent = akdUserAgent
-        } else if advertised.contains("Mac OS X;10.12")
-            || advertised.contains("macOS;10.12")
-            || advertised.contains("<Mac OS X;10.")
-            || (advertised.contains("Mac OS X;") && !advertised.contains("Mac OS X;10.13") && !advertised.contains("Mac OS X;10.14") && !advertised.contains("Mac OS X;10.15") && !advertised.contains("macOS;1"))
-            || advertised.contains("<macOS;10.12") {
-            // mac_version < (10, 13) → current Mac
-            clientInfo = currentMacClientInfo
-            userAgent = currentMacUserAgent
-        } else if advertised.contains("<macOS;") || advertised.contains("<Mac OS X;") || advertised.contains("MacBook") || advertised.contains("<Mac") {
-            // Mac 10.13+ — keep advertised (or still upgrade ancient strings)
-            if advertised.contains("10.12") {
-                clientInfo = currentMacClientInfo
-                userAgent = currentMacUserAgent
-            } else {
-                clientInfo = advertised
-                var ua = anisetteData.userAgent.trimmingCharacters(in: .whitespacesAndNewlines)
-                if ua.isEmpty { ua = akdUserAgent }
-                userAgent = ua
-            }
-        } else if advertised.contains("<PC>") || advertised.contains("Windows") {
-            clientInfo = advertised.isEmpty ? windowsClientInfo : advertised
-            userAgent = akdUserAgent
-        } else {
-            clientInfo = currentMacClientInfo
-            userAgent = currentMacUserAgent
+        // SideInstaller client_info_to_use — one identity; stock/Android/Xcode → safe client.
+        // GSA answers stock Xcode-named clients and bad identities with HTTP 503.
+        let resolved = Self.resolveClientIdentity(from: anisetteData)
+        let currentMac = "<MacBookPro18,3> <macOS;26.6;25F84> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
+        let currentMacUA = "AuthKit/1 (Macintosh; OS X 26.6) (com.apple.akd/1.0)"
+        let windowsCI = "<PC> <Windows;6.2(0,0);9200> <com.apple.AuthKit/1 (com.apple.iTunes/12.12.4.1)>"
+        let akdUA = "akd/1.0 CFNetwork/808.1.4"
+
+        var clientInfo = resolved.clientInfo
+        var userAgent = resolved.userAgent
+        if userAgent.contains("Xcode") || userAgent.contains("Macintosh") && userAgent.contains("dt.") {
+            userAgent = akdUA
+        }
+        if clientInfo.contains("com.apple.dt.Xcode") {
+            // Stock omnisette clients with Xcode in the string → Windows (SideInstaller)
+            clientInfo = windowsCI
+            userAgent = akdUA
         }
 
-        let headers: [String: String] = [
-            "Content-Type": "text/x-xml-plist",
-            "Accept": "text/x-xml-plist",
-            "X-Mme-Client-Info": clientInfo,
-            "User-Agent": userAgent,
-            "X-Xcode-Version": "14.2 (14C18)",
-            "X-Apple-App-Info": "com.apple.gs.xcode.auth",
-            "Connection": "close"
-        ]
-        headers.forEach { request.setValue($1, forHTTPHeaderField: $0) }
+        func applyGrandSlamHeaders(_ req: inout URLRequest, clientInfo: String, userAgent: String) {
+            let allHeaders: [String: String] = [
+                "Content-Type": h.grandSlam.contentType,
+                "Accept": h.grandSlam.accept,
+                "User-Agent": userAgent,
+                "X-Mme-Client-Info": clientInfo,
+                "X-Xcode-Version": "14.2 (14C18)",
+                "X-Apple-App-Info": h.grandSlam.appInfo.isEmpty ? "com.apple.gs.xcode.auth" : h.grandSlam.appInfo,
+                "X-Apple-I-MD-M": anisetteData.machineID,
+                "X-Apple-I-MD": anisetteData.oneTimePassword,
+                "X-Apple-I-MD-LU": anisetteData.localUserID,
+                "X-Apple-I-MD-RINFO": anisetteData.routingInfo,
+                "X-Apple-I-SRL-NO": anisetteData.serialNumber,
+                "X-Apple-I-Client-Time": anisetteData.clientTime,
+                "X-Apple-Locale": anisetteData.locale,
+                "X-Apple-I-TimeZone": anisetteData.timeZone,
+                "X-MMe-Device-Id": anisetteData.deviceID,
+                "Connection": "close", // SideInstaller: GSA answers reused connections with 5xx
+            ]
+            allHeaders.forEach { req.setValue($1, forHTTPHeaderField: $0) }
+        }
 
+        applyGrandSlamHeaders(&request, clientInfo: clientInfo, userAgent: userAgent)
         if let allHeaders = request.allHTTPHeaderFields {
             verboseLog("[SideSign] sendAuthenticationRequest HTTP headers: \(prettyJSONString(from: sanitizeHeadersForLogging(allHeaders)))")
         }
 
-        // SideInstaller: retry HTTP 429 / 503 with spaced backoff
-        let retryDelays: [UInt64] = [2_000_000_000, 5_000_000_000, 10_000_000_000, 15_000_000_000] // 2s, 5s, 10s, 15s — SideInstaller-style 503 backoff
+        // SideInstaller: retry 429; also retry 503 with alternate safe clients (Mac then Windows)
+        let retryDelays: [UInt64] = [2_000_000_000, 5_000_000_000, 10_000_000_000, 15_000_000_000]
+        let clientFallbacks: [(String, String)] = [
+            (clientInfo, userAgent),
+            (currentMac, currentMacUA),
+            (windowsCI, akdUA),
+            (currentMac, currentMacUA),
+        ]
         var data = Data()
         var response: URLResponse = URLResponse(url: Constants.URLs.grandSlamAuth, mimeType: nil, expectedContentLength: 0, textEncodingName: nil)
         var statusCode = 0
         var attempt = 0
         while true {
+            let pair = clientFallbacks[min(attempt, clientFallbacks.count - 1)]
+            applyGrandSlamHeaders(&request, clientInfo: pair.0, userAgent: pair.1)
             do {
                 (data, response) = try await session.data(for: request)
             } catch {
@@ -450,10 +449,10 @@ public extension DeveloperPortal {
             }
             let httpResponse = response as? HTTPURLResponse
             statusCode = httpResponse?.statusCode ?? 0
-            let retryable = statusCode == HTTPStatusCodes.tooManyRequests || statusCode == 503
+            let retryable = statusCode == HTTPStatusCodes.tooManyRequests || statusCode == 503 || statusCode == 433
             if retryable, attempt < retryDelays.count {
                 let delay = retryDelays[attempt]
-                debugLog("[SideSign] GrandSlam HTTP \(statusCode) — retrying in \(delay / 1_000_000_000)s (attempt \(attempt + 1))")
+                debugLog("[SideSign] GrandSlam HTTP \(statusCode) — retry \(attempt + 1) in \(delay / 1_000_000_000)s client=\(pair.0.prefix(40))...")
                 try await Task.sleep(nanoseconds: delay)
                 attempt += 1
                 continue
@@ -461,15 +460,15 @@ public extension DeveloperPortal {
             break
         }
 
-        // After retries, refuse HTML/503 so callers purge adi and try another server
         if statusCode == 503 || statusCode == 433 {
             let rawStr = String(data: data, encoding: .utf8) ?? data.hexEncodedString()
             debugLog("[SideSign] GrandSlam still HTTP \(statusCode) after retries: \(rawStr.prefix(200))")
             throw ServerError.badServerResponse(
-                reason: "Apple returned HTTP \(statusCode) after 2FA (temporary refuse). Wait a minute, Reset adi.pb, use jkcoxson/Mac anisette, and try again.",
+                reason: "Apple returned HTTP \(statusCode) on sign-in (often rate-limit or bad anisette). Wait 15–30 minutes, Reset adi.pb, use Auto or a Mac server, try once.",
                 jsonPayload: rawStr
             )
         }
+
         if statusCode != 0 && !(200...299).contains(statusCode) {
             let rawStr = String(data: data, encoding: .utf8) ?? data.hexEncodedString()
             debugLog("[SideSign] GrandSlam HTTP \(statusCode): \(rawStr.prefix(200))")
