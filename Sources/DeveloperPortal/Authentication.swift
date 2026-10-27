@@ -13,6 +13,12 @@ private enum PushedCodeState {
     @TaskLocal static var handled = false
 }
 
+/// SideInstaller: after any 2FA succeeds, login again must not re-enter SMS/device flow
+/// with a different machine identity (that yields GrandSlam HTTP 503).
+private enum Completed2FAState {
+    @TaskLocal static var completed = false
+}
+
 public extension DeveloperPortal {
 
     func authenticate(appleID unsanitizedAppleID: String,
@@ -213,6 +219,15 @@ public extension DeveloperPortal {
                 guard !pushedCode || !PushedCodeState.handled else {
                     throw DeveloperPortalError.requiresTwoFactorAuthentication
                 }
+                // Already finished 2FA this sign-in — Apple asking again usually means
+                // anisette identity changed (new adi). Do not open SMS again.
+                if Completed2FAState.completed {
+                    debugLog("[SideSign] Apple requested 2FA again after completion (HTTP path) — refusing re-entry")
+                    throw ServerError.badServerResponse(
+                        reason: "Apple asked for 2FA again after the code was accepted (anisette identity mismatch). Reset adi.pb and sign in once.",
+                        jsonPayload: authType
+                    )
+                }
                 let isTrustedDevice = pushedCode || authType == "trustedDeviceSecondaryAuth" || authType == "trustedDevice"
                 try await handle2FARequest(
                     isTrustedDevice: isTrustedDevice,
@@ -222,75 +237,64 @@ public extension DeveloperPortal {
                     verificationHandler: verificationHandler,
                     codeAlreadySent: pushedCode
                 )
-                                // SideInstaller: after 2FA, get fresh anisette (new OTP) then login again
-                // with the *same* locked client identity. Stale X-Apple-I-MD after SMS
-                // is a common cause of GrandSlam HTTP 503.
+                                // SideInstaller: after 2FA, login again with the SAME anisette machine
+                // (same adi / MD-M / device). Only clientTime is refreshed.
+                // Fetching a new adi mid-session is what produces GrandSlam HTTP 503
+                // after the SMS code on every account.
                 let formatter = ISO8601DateFormatter()
                 formatter.formatOptions = [.withInternetDateTime]
                 let lockedCI = twoFactorAuthContext.lockedClientInfo
                 let lockedUA = twoFactorAuthContext.lockedUserAgent
 
-                // Brief pause so Apple accepts the verified 2FA session
-                try await Task.sleep(nanoseconds: 2_000_000_000)
+                try await Task.sleep(nanoseconds: 1_500_000_000)
 
                 var lastPost2FAError: Error?
                 let postDelays: [UInt64] = [
-                    2_000_000_000,   // 2s
-                    5_000_000_000,   // 5s
-                    10_000_000_000,  // 10s
-                    20_000_000_000,  // 20s
+                    2_000_000_000,
+                    5_000_000_000,
+                    10_000_000_000,
+                    20_000_000_000,
                 ]
                 for attempt in 0..<postDelays.count {
                     if attempt > 0 {
                         try await Task.sleep(nanoseconds: postDelays[attempt])
                     }
 
-                    // Refresh anisette OTP like SideInstaller get_anisette_data() before login again
-                    var post2FAAnisette = await Self.refreshAnisetteAfter2FA(
-                        original: anisetteData,
-                        lockedClientInfo: lockedCI,
-                        lockedUserAgent: lockedUA
-                    )
+                    var post2FAAnisette = anisetteData
                     post2FAAnisette.clientInfo = lockedCI
                     post2FAAnisette.userAgent = lockedUA
                     post2FAAnisette.clientTime = formatter.string(from: Date())
+                    // Keep machineID / oneTimePassword / deviceID from the 2FA session
 
-                    debugLog("[SideSign] Post-2FA re-login attempt \(attempt + 1)/\(postDelays.count) otpLen=\(post2FAAnisette.oneTimePassword.count) client=\(post2FAAnisette.clientInfo.prefix(48))...")
+                    debugLog("[SideSign] Post-2FA re-login attempt \(attempt + 1)/\(postDelays.count) same-identity client=\(lockedCI.prefix(48))...")
 
                     do {
-                        return try await PushedCodeState.$handled.withValue(true) {
-                            try await authenticate(
-                                appleID: unsanitizedAppleID,
-                                password: password,
-                                anisetteData: post2FAAnisette,
-                                xcodeVersion: xcodeVersion,
-                                machinePassword: machinePassword,
-                                accountRepairHandler: accountRepairHandler,
-                                verificationHandler: verificationHandler
-                            )
+                        return try await Completed2FAState.$completed.withValue(true) {
+                            try await PushedCodeState.$handled.withValue(true) {
+                                try await authenticate(
+                                    appleID: unsanitizedAppleID,
+                                    password: password,
+                                    anisetteData: post2FAAnisette,
+                                    xcodeVersion: xcodeVersion,
+                                    machinePassword: machinePassword,
+                                    accountRepairHandler: accountRepairHandler,
+                                    verificationHandler: verificationHandler
+                                )
+                            }
                         }
                     } catch {
                         let msg = "\(error)".lowercased()
-                        let is503 = msg.contains("503") || msg.contains("433") || msg.contains("temporar")
+                        let is503 = msg.contains("503") || msg.contains("433")
                         debugLog("[SideSign] Post-2FA re-login attempt \(attempt + 1) failed: \(error)")
                         if is503, attempt < postDelays.count - 1 {
                             lastPost2FAError = error
-                            // Force next attempt to clear anisette cache
-                            AnisetteDataManager.shared.clearCache()
                             continue
-                        }
-                        if msg.contains("twofactor") || msg.contains("2fa") || msg.contains("verification") {
-                            lastPost2FAError = error
-                            if attempt < postDelays.count - 1 {
-                                AnisetteDataManager.shared.clearCache()
-                                continue
-                            }
                         }
                         throw error
                     }
                 }
                 throw lastPost2FAError ?? ServerError.badServerResponse(
-                    reason: "Apple returned HTTP 503 after 2FA. Wait several minutes, Reset adi.pb, try once.",
+                    reason: "Apple returned HTTP 503 after SMS. Same anisette identity was kept; wait and try once later.",
                     jsonPayload: ""
                 )
 
