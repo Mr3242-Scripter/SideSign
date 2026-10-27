@@ -1083,22 +1083,51 @@ public extension DeveloperPortal {
                                       mode: String,
                                       context: TwoFactorAuthContext) async throws -> TwoFactorAuthValidationResult
     {
-        var verifyRequest = makeTwoFactorAuthRequest(url: Constants.URLs.phoneSecurityCode, context: context, asMac: true)
+        // SideInstaller verify_sms_2fa — exact:
+        // POST https://gsa.apple.com/auth/verify/phone/securitycode
+        // JSON: { securityCode: { code }, phoneNumber: { id }, mode }
+        let securityCodeURL = URL(string: "https://gsa.apple.com/auth/verify/phone/securitycode")!
+        var verifyRequest = makeTwoFactorAuthRequest(url: securityCodeURL, context: context, asMac: true)
         verifyRequest.httpMethod = "POST"
-        verifyRequest.httpBody = try PropertyListSerialization.data(fromPropertyList: [
-            "securityCode.code": code,
-            "serverInfo": ["mode": mode, "phoneNumber.id": phoneID]
-        ], format: .xml, options: 0)
+        verifyRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        verifyRequest.setValue("application/json", forHTTPHeaderField: "Accept")
+        let phoneIdValue: Int = Int(phoneID) ?? 1
+        let jsonBody: [String: Any] = [
+            "securityCode": ["code": code],
+            "phoneNumber": ["id": phoneIdValue],
+            "mode": mode
+        ]
+        verifyRequest.httpBody = try JSONSerialization.data(withJSONObject: jsonBody)
 
         if let allHeaders = verifyRequest.allHTTPHeaderFields {
             verboseLog("[SideSign] validatePhone2FACode HTTP headers: \(prettyJSONString(from: sanitizeHeadersForLogging(allHeaders)))")
         }
 
-        debugLog("[SideSign] Verifying secondary security code...")
-        let (verifyData, verifyHttpResponse) = try await performTwoFactorRequest(verifyRequest, context: context, actionName: "validate2FACode")
+        debugLog("[SideSign] Verifying phone security code (SideInstaller JSON)...")
+        let (verifyData, verifyHttpResponse) = try await performTwoFactorRequest(verifyRequest, context: context, actionName: "validatePhone2FACode")
         let verifyStatusCode = verifyHttpResponse.safeStatusCode
+        let bodyPreview = String(data: verifyData, encoding: .utf8) ?? ""
 
-        return try parseTwoFactorAuthVerifyResponse(data: verifyData, statusCode: verifyStatusCode, requirePeToken: true, httpResponse: verifyHttpResponse)
+        // SideInstaller: non-success → parse error; -21669 = wrong code → retry
+        if verifyStatusCode == 503 || verifyStatusCode == 433 {
+            debugLog("[SideSign] Phone code submit HTTP \(verifyStatusCode) — retry once after short delay")
+            try await Task.sleep(nanoseconds: 2_000_000_000)
+            let (retryData, retryHttp) = try await performTwoFactorRequest(verifyRequest, context: context, actionName: "validatePhone2FACode-retry")
+            return try parseTwoFactorAuthVerifyResponse(
+                data: retryData,
+                statusCode: retryHttp.safeStatusCode,
+                requirePeToken: false,
+                httpResponse: retryHttp
+            )
+        }
+
+        // SideInstaller does not require X-Apple-PE-Token for phone verify success
+        return try parseTwoFactorAuthVerifyResponse(
+            data: verifyData,
+            statusCode: verifyStatusCode,
+            requirePeToken: false,
+            httpResponse: verifyHttpResponse
+        )
     }
 
     private func parseTwoFactorAuthVerifyResponse(data: Data,
@@ -1144,6 +1173,11 @@ public extension DeveloperPortal {
                 return .retry(message: "Apple won't send a code by text or call to this sign-in, so it was sent to your Apple devices.")
             }
             throw DeveloperPortalError.invalid2FAResponse(cause: message)
+        }
+
+        if statusCode == 503 || statusCode == 433 {
+            debugLog("[SideSign] 2FA verification HTTP \(statusCode) — treating as retryable")
+            return .retry(message: "Apple temporarily refused the code (HTTP \(statusCode)). Wait a moment and try again, or use a code from your other Apple devices.")
         }
 
         guard statusCode == HTTPStatusCodes.ok else {
