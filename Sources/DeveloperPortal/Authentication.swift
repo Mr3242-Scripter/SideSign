@@ -886,7 +886,7 @@ public extension DeveloperPortal {
         debugLog("[SideSign] Requesting trusted device 2FA code...")
         verboseLog("[SideSign] sendTrustedDevice2FACodeRequest for dsid: \(context.dsid)")
 
-        var request = makeTwoFactorAuthRequest(url: Constants.URLs.trustedDevice, context: context, asMac: true)
+        var request = makeTwoFactorAuthRequest(url: Constants.URLs.trustedDevice, context: context, asMac: false)
         request.httpMethod = "GET"
 
         if let allHeaders = request.allHTTPHeaderFields {
@@ -935,7 +935,7 @@ public extension DeveloperPortal {
 
         // SideInstaller: PUT JSON to https://gsa.apple.com/auth/verify/phone
         let phoneURL = URL(string: "https://gsa.apple.com/auth/verify/phone")!
-        var request = makeTwoFactorAuthRequest(url: phoneURL, context: context, asMac: true)
+        var request = makeTwoFactorAuthRequest(url: phoneURL, context: context, asMac: false)
         request.httpMethod = "PUT"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
@@ -1067,7 +1067,7 @@ public extension DeveloperPortal {
     }
 
     private func validateTrustedDevice2FACode(code: String, context: TwoFactorAuthContext) async throws -> TwoFactorAuthValidationResult {
-        var verifyRequest = makeTwoFactorAuthRequest(url: Constants.URLs.grandSlamValidate, context: context, asMac: true)
+        var verifyRequest = makeTwoFactorAuthRequest(url: Constants.URLs.grandSlamValidate, context: context, asMac: false)
         verifyRequest.setValue(code, forHTTPHeaderField: "security-code")
 
         if let allHeaders = verifyRequest.allHTTPHeaderFields {
@@ -1090,7 +1090,7 @@ public extension DeveloperPortal {
         // POST https://gsa.apple.com/auth/verify/phone/securitycode
         // JSON: { securityCode: { code }, phoneNumber: { id }, mode }
         let securityCodeURL = URL(string: "https://gsa.apple.com/auth/verify/phone/securitycode")!
-        var verifyRequest = makeTwoFactorAuthRequest(url: securityCodeURL, context: context, asMac: true)
+        var verifyRequest = makeTwoFactorAuthRequest(url: securityCodeURL, context: context, asMac: false)
         verifyRequest.httpMethod = "POST"
         verifyRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
         verifyRequest.setValue("application/json", forHTTPHeaderField: "Accept")
@@ -1303,16 +1303,16 @@ public extension DeveloperPortal {
         var request = URLRequest(url: url)
         let a = context.anisetteData
         let h = customHeaders
-        // SideInstaller: same client for the whole sign-in; auth pages retry as MAC_CLIENT_INFO on bare 403
-        let resolved = Self.resolveClientIdentity(from: a)
+        // SideInstaller: same client whole sign-in (locked). Auth pages only switch to
+        // MAC_CLIENT_INFO on bare 403 (performTwoFactorRequest), not on every request.
         let clientInfo: String
         let ua: String
         if asMac {
             clientInfo = Self.macClientInfoFor2FA
             ua = "AuthKit/1 (Macintosh; OS X 27.0) (com.apple.akd/1.0)"
         } else {
-            clientInfo = resolved.clientInfo
-            ua = resolved.userAgent
+            clientInfo = context.lockedClientInfo
+            ua = context.lockedUserAgent
         }
         let headers: [String: String] = [
             "Accept": "application/x-buddyml",
@@ -1349,11 +1349,12 @@ public extension DeveloperPortal {
             let status = http?.safeStatusCode ?? 0
             let body = String(data: data, encoding: .utf8) ?? ""
 
-            let shouldRetryAsMac =
-                !triedMac
-                && (status == 403 || status == 503 || status == 500 || status == 433 || status == 0)
+            // SideInstaller refuses_client: only bare 403 (no serviceErrors), not 503
+            let hasServiceErrors = body.contains("serviceErrors") || body.contains(""ec"")
+            let bare403 = status == 403 && !hasServiceErrors
+            let shouldRetryAsMac = !triedMac && bare403
             if shouldRetryAsMac {
-                debugLog("[SideSign] \(actionName) HTTP \(status) — retrying as Mac (SideInstaller 2FA parity)")
+                debugLog("[SideSign] \(actionName) bare HTTP 403 — retrying as MAC_CLIENT_INFO (SideInstaller send_auth)")
                 guard let url = current.url else {
                     throw ServerError.badServerResponse(reason: "\(actionName) missing URL", jsonPayload: body)
                 }
