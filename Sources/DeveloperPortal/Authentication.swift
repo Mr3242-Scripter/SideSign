@@ -392,16 +392,9 @@ public extension DeveloperPortal {
         let windowsCI = "<PC> <Windows;6.2(0,0);9200> <com.apple.AuthKit/1 (com.apple.iTunes/12.12.4.1)>"
         let akdUA = "akd/1.0 CFNetwork/808.1.4"
 
-        var clientInfo = resolved.clientInfo
-        var userAgent = resolved.userAgent
-        if userAgent.contains("Xcode") || userAgent.contains("Macintosh") && userAgent.contains("dt.") {
-            userAgent = akdUA
-        }
-        if clientInfo.contains("com.apple.dt.Xcode") {
-            // Stock omnisette clients with Xcode in the string → Windows (SideInstaller)
-            clientInfo = windowsCI
-            userAgent = akdUA
-        }
+        // SideInstaller 1.6.1: always report CURRENT_MAC through Mac ADI (fixes -80046)
+        var clientInfo = currentMac
+        var userAgent = currentMacUA
 
         func applyGrandSlamHeaders(_ req: inout URLRequest, clientInfo: String, userAgent: String) {
             let allHeaders: [String: String] = [
@@ -432,10 +425,11 @@ public extension DeveloperPortal {
 
         // SideInstaller: retry 429; also retry 503 with alternate safe clients (Mac then Windows)
         let retryDelays: [UInt64] = [2_000_000_000, 5_000_000_000, 10_000_000_000, 15_000_000_000]
+        // Never switch to Windows mid-session on Mac ADI — that causes -80046 after the code
         let clientFallbacks: [(String, String)] = [
-            (clientInfo, userAgent),
             (currentMac, currentMacUA),
-            (windowsCI, akdUA),
+            (currentMac, currentMacUA),
+            (currentMac, currentMacUA),
             (currentMac, currentMacUA),
         ]
         var data = Data()
@@ -1269,12 +1263,12 @@ public extension DeveloperPortal {
 
 
     private static func resolveClientIdentity(from anisetteData: AnisetteData) -> (clientInfo: String, userAgent: String) {
-        // SideInstaller remote_v3::client_info_to_use — exact
+        // SideInstaller remote_v3::client_info_to_use + 1.6.1 Mac ADI path
+        // -80046 after the code = Android ADI or non-current Mac through Mac servers
         let currentMac = "<MacBookPro18,3> <macOS;26.6;25F84> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
         let currentMacUA = "AuthKit/1 (Macintosh; OS X 26.6) (com.apple.akd/1.0)"
         let windows = "<PC> <Windows;6.2(0,0);9200> <com.apple.AuthKit/1 (com.apple.iTunes/12.12.4.1)>"
         let akdUA = "akd/1.0 CFNetwork/808.1.4"
-        // Stock clients from anisette-v3-server / omnisette (always Android ADI)
         let stockPrefixes = [
             "<MacBookPro13,2> <macOS;13.1;22C65>",
             "<MacBookPro15,1> <Mac OS X;10.15.2;19C57>",
@@ -1282,16 +1276,19 @@ public extension DeveloperPortal {
         let advertised = anisetteData.clientInfo.trimmingCharacters(in: .whitespacesAndNewlines)
         let isAndroid = advertised.contains("<Android;")
         let isStock = stockPrefixes.contains { advertised.hasPrefix($0) }
+        // Android / stock omnisette → Windows only when not using Mac ADI (SideInstaller skips Android login)
         if advertised.isEmpty || isAndroid || isStock {
-            return (windows, akdUA)
-        }
-        // mac_version < (10, 13) — servers name 10.12.6
-        if advertised.contains("10.12") || advertised.contains("Mac OS X;10.11") || advertised.contains("Mac OS X;10.10") {
+            // Prefer CURRENT_MAC so Mac-server sessions never finish as Windows (-80046)
             return (currentMac, currentMacUA)
         }
-        var ua = anisetteData.userAgent.trimmingCharacters(in: .whitespacesAndNewlines)
-        if ua.isEmpty { ua = akdUA }
-        return (advertised, ua)
+        // Any Mac (including 10.12 named by Mac ADI servers) → CURRENT_MAC (SideInstaller 1.6.1)
+        if advertised.contains("MacBook") || advertised.contains("Mac OS") || advertised.contains("macOS") || advertised.contains("<Mac") {
+            return (currentMac, currentMacUA)
+        }
+        if advertised.contains("<PC>") || advertised.contains("Windows") {
+            return (windows, akdUA)
+        }
+        return (currentMac, currentMacUA)
     }
 
     private static let macClientInfoFor2FA = "<Mac15,7> <macOS;27.0;26A5378j> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
