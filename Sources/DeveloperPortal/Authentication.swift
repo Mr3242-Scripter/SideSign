@@ -398,12 +398,12 @@ public extension DeveloperPortal {
 
         func applyGrandSlamHeaders(_ req: inout URLRequest, clientInfo: String, userAgent: String) {
             let allHeaders: [String: String] = [
-                "Content-Type": h.grandSlam.contentType,
-                "Accept": h.grandSlam.accept,
+                "Content-Type": "text/x-xml-plist",
+                "Accept": "text/x-xml-plist",
                 "User-Agent": userAgent,
                 "X-Mme-Client-Info": clientInfo,
                 "X-Xcode-Version": "14.2 (14C18)",
-                "X-Apple-App-Info": h.grandSlam.appInfo.isEmpty ? "com.apple.gs.xcode.auth" : h.grandSlam.appInfo,
+                "X-Apple-App-Info": h.grandSlam.authApp.isEmpty ? "com.apple.gs.xcode.auth" : h.grandSlam.authApp,
                 "X-Apple-I-MD-M": anisetteData.machineID,
                 "X-Apple-I-MD": anisetteData.oneTimePassword,
                 "X-Apple-I-MD-LU": anisetteData.localUserID,
@@ -1086,8 +1086,6 @@ public extension DeveloperPortal {
         debugLog("[SideSign] Verifying phone security code (SideInstaller JSON)...")
         let (verifyData, verifyHttpResponse) = try await performTwoFactorRequest(verifyRequest, context: context, actionName: "validatePhone2FACode")
         let verifyStatusCode = verifyHttpResponse.safeStatusCode
-        let bodyPreview = String(data: verifyData, encoding: .utf8) ?? ""
-
         // SideInstaller: non-success → parse error; -21669 = wrong code → retry
         if verifyStatusCode == 503 || verifyStatusCode == 433 {
             debugLog("[SideSign] Phone code submit HTTP \(verifyStatusCode) — retry once after short delay")
@@ -1330,7 +1328,7 @@ public extension DeveloperPortal {
             let body = String(data: data, encoding: .utf8) ?? ""
 
             // SideInstaller refuses_client: only bare 403 (no serviceErrors), not 503
-            let hasServiceErrors = body.contains("serviceErrors") || body.contains(""ec"")
+            let hasServiceErrors = body.contains("serviceErrors") || body.contains("ec")
             let bare403 = status == 403 && !hasServiceErrors
             let shouldRetryAsMac = !triedMac && bare403
             if shouldRetryAsMac {
