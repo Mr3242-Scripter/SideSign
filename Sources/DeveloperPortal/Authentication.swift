@@ -225,7 +225,7 @@ public extension DeveloperPortal {
                     debugLog("[SideSign] Apple requested 2FA again after completion (HTTP path) — refusing re-entry")
                     throw ServerError.badServerResponse(
                         reason: "Apple asked for 2FA again after the code was accepted (anisette identity mismatch). Reset adi.pb and sign in once.",
-                        jsonPayload: authType
+                        jsonPayload: authType ?? ""
                     )
                 }
                 let isTrustedDevice = pushedCode || authType == "trustedDeviceSecondaryAuth" || authType == "trustedDevice"
@@ -386,15 +386,12 @@ public extension DeveloperPortal {
 
         // SideInstaller client_info_to_use — one identity; stock/Android/Xcode → safe client.
         // GSA answers stock Xcode-named clients and bad identities with HTTP 503.
-        let resolved = Self.resolveClientIdentity(from: anisetteData)
         let currentMac = "<MacBookPro18,3> <macOS;26.6;25F84> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
         let currentMacUA = "AuthKit/1 (Macintosh; OS X 26.6) (com.apple.akd/1.0)"
-        let windowsCI = "<PC> <Windows;6.2(0,0);9200> <com.apple.AuthKit/1 (com.apple.iTunes/12.12.4.1)>"
-        let akdUA = "akd/1.0 CFNetwork/808.1.4"
 
         // SideInstaller 1.6.1: always report CURRENT_MAC through Mac ADI (fixes -80046)
-        var clientInfo = currentMac
-        var userAgent = currentMacUA
+        let clientInfo = currentMac
+        let userAgent = currentMacUA
 
         func applyGrandSlamHeaders(_ req: inout URLRequest, clientInfo: String, userAgent: String) {
             let allHeaders: [String: String] = [
