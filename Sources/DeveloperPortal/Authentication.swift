@@ -246,14 +246,15 @@ public extension DeveloperPortal {
                 let lockedCI = twoFactorAuthContext.lockedClientInfo
                 let lockedUA = twoFactorAuthContext.lockedUserAgent
 
-                try await Task.sleep(nanoseconds: 1_500_000_000)
+                try await Task.sleep(nanoseconds: 5_000_000_000) // SideInstaller: let Apple commit the SMS session
 
                 var lastPost2FAError: Error?
                 let postDelays: [UInt64] = [
-                    2_000_000_000,
-                    5_000_000_000,
-                    10_000_000_000,
-                    20_000_000_000,
+                    3_000_000_000,
+                    8_000_000_000,
+                    15_000_000_000,
+                    30_000_000_000,
+                    45_000_000_000,
                 ]
                 for attempt in 0..<postDelays.count {
                     if attempt > 0 {
@@ -437,7 +438,7 @@ public extension DeveloperPortal {
             let pair = clientFallbacks[min(attempt, clientFallbacks.count - 1)]
             applyGrandSlamHeaders(&request, clientInfo: pair.0, userAgent: pair.1)
             do {
-                (data, response) = try await session.data(for: request)
+                (data, response) = try await dataWithFreshConnection(for: request)
             } catch {
                 debugLog("[SideSign] sendAuthenticationRequest network error: \(error)")
                 throw error
@@ -1097,14 +1098,23 @@ public extension DeveloperPortal {
         let verifyStatusCode = verifyHttpResponse.safeStatusCode
         // SideInstaller: non-success → parse error; -21669 = wrong code → retry
         if verifyStatusCode == 503 || verifyStatusCode == 433 {
-            debugLog("[SideSign] Phone code submit HTTP \(verifyStatusCode) — retry once after short delay")
-            try await Task.sleep(nanoseconds: 2_000_000_000)
-            let (retryData, retryHttp) = try await performTwoFactorRequest(verifyRequest, context: context, actionName: "validatePhone2FACode-retry")
+            var lastData = verifyData
+            var lastStatus = verifyStatusCode
+            var lastHttp = verifyHttpResponse
+            for (i, delay) in [3_000_000_000, 8_000_000_000, 15_000_000_000].enumerated() {
+                debugLog("[SideSign] Phone code submit HTTP \(lastStatus) — retry \(i + 1) after \(delay / 1_000_000_000)s")
+                try await Task.sleep(nanoseconds: delay)
+                let (retryData, retryHttp) = try await performTwoFactorRequest(verifyRequest, context: context, actionName: "validatePhone2FACode-retry")
+                lastData = retryData
+                lastStatus = retryHttp.safeStatusCode
+                lastHttp = retryHttp
+                if lastStatus != 503 && lastStatus != 433 { break }
+            }
             return try parseTwoFactorAuthVerifyResponse(
-                data: retryData,
-                statusCode: retryHttp.safeStatusCode,
+                data: lastData,
+                statusCode: lastStatus,
                 requirePeToken: false,
-                httpResponse: retryHttp
+                httpResponse: lastHttp
             )
         }
 
@@ -1252,6 +1262,21 @@ public extension DeveloperPortal {
     }
 
 
+    
+    /// SideInstaller uses a fresh TCP connection per GSA request (pool_max_idle_per_host = 0).
+    /// Reused HTTP/2 connections are a known source of GrandSlam HTTP 503.
+    private func dataWithFreshConnection(for request: URLRequest) async throws -> (Data, URLResponse) {
+        let config = URLSessionConfiguration.ephemeral
+        config.httpShouldUsePipelining = false
+        config.httpMaximumConnectionsPerHost = 1
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        config.timeoutIntervalForRequest = 60
+        config.timeoutIntervalForResource = 90
+        let ephemeral = URLSession(configuration: config)
+        defer { ephemeral.invalidateAndCancel() }
+        return try await ephemeral.data(for: request)
+    }
+
     private static func resolveClientIdentity(from anisetteData: AnisetteData) -> (clientInfo: String, userAgent: String) {
         // SideInstaller remote_v3::client_info_to_use + 1.6.1 Mac ADI path
         // -80046 after the code = Android ADI or non-current Mac through Mac servers
@@ -1331,7 +1356,7 @@ public extension DeveloperPortal {
         var current = request
         var triedMac = false
         while true {
-            let (data, response) = try await session.data(for: current)
+            let (data, response) = try await dataWithFreshConnection(for: current)
             let http = response as? HTTPURLResponse
             let status = http?.safeStatusCode ?? 0
             let body = String(data: data, encoding: .utf8) ?? ""
