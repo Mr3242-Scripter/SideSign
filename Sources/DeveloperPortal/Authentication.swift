@@ -745,42 +745,22 @@ public extension DeveloperPortal {
             phoneNumbers = parseTrustedPhoneNumbers(from: statusDictionary)
         }
 
-        // SideInstaller LoginState (apple_account.rs):
-        //   trustedDeviceSecondaryAuth / pushedCode → NeedsDevice2FA
-        //   secondaryAuth → NeedsSMS2FA; bare 403 / iCloud → NeedsDevice2FA (PHONE_CODE_REFUSED)
-        let preferredMode: TwoFactorDeliveryMode = .trustedDevice
+        // SideInstaller 1.6.1: prefer devices. Apple's "Could not connect to iCloud"
+        // means phone refused — never surface that string; always keep a code field.
         let phoneCodeRefusedMessage = "Apple won't send a code by text or call to this sign-in, so it was sent to your Apple devices."
         let deviceCodeUnconfirmedMessage = "Apple didn't confirm sending a code to your Apple devices. If one arrived, enter it; if not, try another way."
 
-        var currentRequest: TwoFactorRequest
-        var activeChannel: TwoFactorAuthChannel?
-        if codeAlreadySent || isTrustedDevice {
-            // NeedsDevice2FA
-            do {
-                try await sendTrustedDevice2FACodeRequest(context: context)
-                currentRequest = .trustedDevice(error: nil)
-            } catch {
-                debugLog("[SideSign] Trusted-device request soft-fail (\(error)); DEVICE_CODE_UNCONFIRMED")
-                currentRequest = .trustedDevice(error: deviceCodeUnconfirmedMessage)
-            }
-            activeChannel = .trustedDevice
-        } else {
-            // NeedsSMS2FA — try phone first like SideInstaller; on refuse → devices
-            let phoneID = phoneNumbers.first?.id ?? "1"
-            do {
-                let result = try await sendPhone2FACodeRequest(mode: "sms", phoneID: phoneID, knownPhoneNumbers: phoneNumbers, context: context)
-                phoneNumbers = result.phoneNumbers.isEmpty ? phoneNumbers : result.phoneNumbers
-                activeChannel = .sms(phoneID: result.phoneID)
-                currentRequest = .sms(phoneNumbers: phoneNumbers, activeID: result.phoneID, error: nil)
-            } catch {
-                debugLog("[SideSign] SMS refused (\(error)); PHONE_CODE_REFUSED → NeedsDevice2FA")
-                do { try await sendTrustedDevice2FACodeRequest(context: context) } catch {
-                    debugLog("[SideSign] Device fallback after SMS refuse: \(error)")
-                }
-                activeChannel = .trustedDevice
-                currentRequest = .trustedDevice(error: phoneCodeRefusedMessage)
-            }
+        // Always open on trusted-device prompt (codeAlreadySent or not).
+        // Soft-send device push; failure still allows entering a code that arrived.
+        do {
+            try await sendTrustedDevice2FACodeRequest(context: context)
+        } catch {
+            debugLog("[SideSign] Initial device push soft-fail: \(error)")
         }
+        var currentRequest: TwoFactorRequest = .trustedDevice(
+            error: codeAlreadySent ? nil : deviceCodeUnconfirmedMessage
+        )
+        var activeChannel: TwoFactorAuthChannel? = .trustedDevice
 
         while true {
             debugLog("[SideSign] Prompting user with 2FA request (\(currentRequest))...")
@@ -793,70 +773,80 @@ public extension DeveloperPortal {
                         activeChannel = .trustedDevice
                         currentRequest = .trustedDevice(error: nil)
                     } catch {
-                        debugLog("[SideSign] Trusted-device push failed (\(error)); still prompting for code")
+                        debugLog("[SideSign] Device push failed (\(error)); still accept code")
                         activeChannel = .trustedDevice
                         currentRequest = .trustedDevice(error: deviceCodeUnconfirmedMessage)
                     }
 
                 case .requestSMS(let targetPhoneID):
                     do {
-                        let result = try await sendPhone2FACodeRequest(mode: "sms", phoneID: targetPhoneID, knownPhoneNumbers: phoneNumbers, context: context)
-                        phoneNumbers = result.phoneNumbers
+                        let result = try await sendPhone2FACodeRequest(
+                            mode: "sms",
+                            phoneID: targetPhoneID,
+                            knownPhoneNumbers: phoneNumbers,
+                            context: context
+                        )
+                        phoneNumbers = result.phoneNumbers.isEmpty ? phoneNumbers : result.phoneNumbers
                         activeChannel = .sms(phoneID: result.phoneID)
                         currentRequest = .sms(phoneNumbers: phoneNumbers, activeID: result.phoneID, error: nil)
                     } catch {
-                        // SideInstaller PHONE_CODE_REFUSED: 403 / 423 / iCloud / any phone failure → devices
-                        let msg = "\(error)"
-                        debugLog("[SideSign] SMS 2FA failed (\(msg)); falling back to trusted device")
-                        do { try await sendTrustedDevice2FACodeRequest(context: context) } catch {
-                            debugLog("[SideSign] Trusted-device fallback after SMS also failed: \(error)")
-                        }
+                        debugLog("[SideSign] SMS refused (\(error)); PHONE_CODE_REFUSED → devices")
+                        do { try await sendTrustedDevice2FACodeRequest(context: context) } catch {}
                         activeChannel = .trustedDevice
                         currentRequest = .trustedDevice(error: phoneCodeRefusedMessage)
                     }
 
                 case .requestVoice(let targetPhoneID):
                     do {
-                        let result = try await sendPhone2FACodeRequest(mode: "voice", phoneID: targetPhoneID, knownPhoneNumbers: phoneNumbers, context: context)
-                        phoneNumbers = result.phoneNumbers
+                        let result = try await sendPhone2FACodeRequest(
+                            mode: "voice",
+                            phoneID: targetPhoneID,
+                            knownPhoneNumbers: phoneNumbers,
+                            context: context
+                        )
+                        phoneNumbers = result.phoneNumbers.isEmpty ? phoneNumbers : result.phoneNumbers
                         activeChannel = .voice(phoneID: result.phoneID)
                         currentRequest = .voice(phoneNumbers: phoneNumbers, activeID: result.phoneID, error: nil)
                     } catch {
-                        let msg = "\(error)"
-                        debugLog("[SideSign] Voice 2FA failed (\(msg)); falling back to trusted device")
-                        do { try await sendTrustedDevice2FACodeRequest(context: context) } catch {
-                            debugLog("[SideSign] Trusted-device fallback after voice also failed: \(error)")
-                        }
+                        debugLog("[SideSign] Voice refused (\(error)); PHONE_CODE_REFUSED → devices")
+                        do { try await sendTrustedDevice2FACodeRequest(context: context) } catch {}
                         activeChannel = .trustedDevice
                         currentRequest = .trustedDevice(error: phoneCodeRefusedMessage)
                     }
 
                 case .verificationCode(let code):
                     guard let channel = activeChannel else {
-                        debugLog("[SideSign] Unexpected verification code returned before delivery method was selected.")
-                        throw DeveloperPortalError.authenticationHandshakeFailed(cause: "Unexpected verification code returned before a delivery method was selected.")
+                        activeChannel = .trustedDevice
+                        currentRequest = .trustedDevice(error: deviceCodeUnconfirmedMessage)
+                        continue
                     }
-
                     let result: TwoFactorAuthValidationResult
-                    switch channel {
-                        case .trustedDevice:
-                            result = try await validateTrustedDevice2FACode(code: code, context: context)
-                        case .sms(let phoneID):
-                            result = try await validatePhone2FACode(code: code, phoneID: phoneID, mode: "sms", context: context)
-                        case .voice(let phoneID):
-                            result = try await validatePhone2FACode(code: code, phoneID: phoneID, mode: "voice", context: context)
+                    do {
+                        switch channel {
+                            case .trustedDevice:
+                                result = try await validateTrustedDevice2FACode(code: code, context: context)
+                            case .sms(let phoneID):
+                                result = try await validatePhone2FACode(code: code, phoneID: phoneID, mode: "sms", context: context)
+                            case .voice(let phoneID):
+                                result = try await validatePhone2FACode(code: code, phoneID: phoneID, mode: "voice", context: context)
+                        }
+                    } catch {
+                        // Never bubble "Could not connect to iCloud"
+                        let msg = "\(error)"
+                        debugLog("[SideSign] Code validation error (\(msg)); back to device prompt")
+                        activeChannel = .trustedDevice
+                        currentRequest = .trustedDevice(error: Self.isPhoneOrICloudRefuse(msg) ? phoneCodeRefusedMessage : deviceCodeUnconfirmedMessage)
+                        continue
                     }
-
                     switch result {
                         case .success:
                             debugLog("[SideSign] 2FA code verified successfully!")
                             return
                         case .retry(let message):
-                            debugLog("[SideSign] 2FA verification failed, retrying: \(message)")
-                            if Self.isPhoneOrICloudRefuse(message) || message.contains("PHONE_CODE_REFUSED") || message.contains("won't send a code by text") {
+                            if Self.isPhoneOrICloudRefuse(message) || message.contains("PHONE_CODE_REFUSED") {
                                 do { try await sendTrustedDevice2FACodeRequest(context: context) } catch {}
                                 activeChannel = .trustedDevice
-                                currentRequest = .trustedDevice(error: "Apple won't send a code by text or call to this sign-in, so it was sent to your Apple devices.")
+                                currentRequest = .trustedDevice(error: phoneCodeRefusedMessage)
                                 continue
                             }
                             switch channel {
@@ -887,28 +877,21 @@ public extension DeveloperPortal {
             verboseLog("[SideSign] sendTrustedDevice2FACodeRequest HTTP headers: \(prettyJSONString(from: sanitizeHeadersForLogging(allHeaders)))")
         }
 
-        let (data, httpResponse) = try await performTwoFactorRequest(request, context: context, actionName: "sendTrustedDevice2FACodeRequest")
-        let statusCode = httpResponse.safeStatusCode
-        // SideInstaller DEVICE_CODE_UNCONFIRMED: 403 / iCloud still allow entering a code
-        let rawPreview = String(data: data, encoding: .utf8) ?? ""
-        let lowerPreview = rawPreview.lowercased()
-        if statusCode == 403 || statusCode == 401
-            || lowerPreview.contains("icloud")
-            || lowerPreview.contains("could not connect")
-        {
-            debugLog("[SideSign] Trusted-device request soft-fail (HTTP \(statusCode)); prompting for code if one arrived")
-            return
-        }
-        // Non-iCloud XMLUI alerts still throw
-        try throwIfXMLUIErrorAlert(in: data, statusCode: statusCode, actionName: "sendTrustedDevice2FACodeRequest")
-
-        guard statusCode == HTTPStatusCodes.ok else {
-            let rawStr = prettyJSONString(from: data)
-            debugLog("[SideSign] sendTrustedDevice2FACodeRequest failed (HTTP \(statusCode)): \(rawStr)")
-            if statusCode == 403 || statusCode == 401 {
-                return
+        do {
+            let (data, httpResponse) = try await performTwoFactorRequest(request, context: context, actionName: "sendTrustedDevice2FACodeRequest")
+            let statusCode = httpResponse.safeStatusCode
+            let rawPreview = String(data: data, encoding: .utf8) ?? ""
+            // SideInstaller DEVICE_CODE_UNCONFIRMED: never throw — always allow code entry
+            if statusCode != HTTPStatusCodes.ok
+                || rawPreview.lowercased().contains("icloud")
+                || rawPreview.lowercased().contains("could not connect")
+            {
+                debugLog("[SideSign] Trusted-device request soft-fail (HTTP \(statusCode)); prompting for code if one arrived")
+            } else {
+                debugLog("[SideSign] Trusted-device code request accepted")
             }
-            throw ServerError.badServerResponse(reason: "Trusted device request failed (HTTP \(statusCode))", jsonPayload: rawStr)
+        } catch {
+            debugLog("[SideSign] Trusted-device request error soft-fail: \(error)")
         }
     }
 
@@ -959,7 +942,7 @@ public extension DeveloperPortal {
             .filter { !$0.isEmpty }
             .joined(separator: ": ")
         let alertLower = alertCombined.lowercased()
-        if statusCode == 403
+        if statusCode == 403 || statusCode == 503 || statusCode == 423 || statusCode == 401
             || alertLower.contains("icloud")
             || alertLower.contains("could not connect")
             || alertLower.contains("forbidden")
@@ -974,7 +957,7 @@ public extension DeveloperPortal {
         }
         if xmluiTitle != nil || xmluiMessage != nil {
             debugLog("[SideSign] sendPhone2FACodeRequest alert from Apple (HTTP \(statusCode)): \(alertCombined)")
-            throw DeveloperPortalError.invalid2FAResponse(cause: xmluiMessage ?? alertCombined)
+            throw DeveloperPortalError.invalid2FAResponse(cause: "PHONE_CODE_REFUSED")
         }
 
         let responseDict = parsePlistOrJSON(data)
