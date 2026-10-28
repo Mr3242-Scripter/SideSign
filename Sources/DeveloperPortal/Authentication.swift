@@ -661,10 +661,8 @@ public extension DeveloperPortal {
             debugLog("[SideSign] \(actionName) alert from Apple (HTTP \(statusCode)): \(alertMsg)")
             // SideInstaller: never surface Apple's "Could not connect to iCloud" — map to phone refused
             let lower = alertMsg.lowercased()
-            if lower.contains("icloud") || lower.contains("could not connect") {
-                throw DeveloperPortalError.invalid2FAResponse(cause: "PHONE_CODE_REFUSED")
-            }
-            throw DeveloperPortalError.invalid2FAResponse(cause: xmluiMessage ?? alertMsg)
+            // Always map to PHONE_CODE_REFUSED — never pass Apple's iCloud wording to the UI
+            throw DeveloperPortalError.invalid2FAResponse(cause: "PHONE_CODE_REFUSED")
         }
     }
 
@@ -675,6 +673,20 @@ public extension DeveloperPortal {
             || t.contains("could not connect")
             || t.contains("phone_code_refused")
             || t == "phone_code_refused"
+            || t.contains("could not connect to icloud")
+    }
+
+    /// Never show Apple's "Could not connect to iCloud" / internal markers to the user.
+    private static func sanitize2FAUserMessage(_ text: String?) -> String {
+        guard let text, !text.isEmpty else { return "Apple didn't confirm sending a code to your Apple devices. If one arrived, enter it; if not, try another way." }
+        if isPhoneOrICloudRefuse(text) || text == "PHONE_CODE_REFUSED" {
+            return "Apple won't send a code by text or call to this sign-in, so it was sent to your Apple devices."
+        }
+        let lower = text.lowercased()
+        if lower.contains("icloud") {
+            return "Apple won't send a code by text or call to this sign-in, so it was sent to your Apple devices."
+        }
+        return text
     }
 
     private func parseXMLUIObfuscatedNumber(from data: Data) -> String? {
@@ -980,7 +992,7 @@ public extension DeveloperPortal {
         } else if errorCode != 0 {
             let msg = errorMsg ?? "Failed to request verification code from Apple."
             debugLog("[SideSign] sendPhone2FACodeRequest error (\(errorCode), HTTP \(statusCode)): \(msg)")
-            throw ServerError.underlyingError(code: errorCode, message: msg)
+            throw ServerError.underlyingError(code: errorCode, message: Self.sanitize2FAUserMessage(msg))
         }
 
         guard statusCode == HTTPStatusCodes.ok else {
@@ -1137,7 +1149,7 @@ public extension DeveloperPortal {
             if Self.isPhoneOrICloudRefuse(msg) {
                 return .retry(message: "Apple won't send a code by text or call to this sign-in, so it was sent to your Apple devices.")
             }
-            throw ServerError.underlyingError(code: errorCode, message: msg)
+            throw ServerError.underlyingError(code: errorCode, message: Self.sanitize2FAUserMessage(msg))
         }
 
         if xmluiTitle != nil || xmluiMessage != nil {
@@ -1147,7 +1159,7 @@ public extension DeveloperPortal {
                 // Treat as wrong channel / refused phone — ask user to use device code
                 return .retry(message: "Apple won't send a code by text or call to this sign-in, so it was sent to your Apple devices.")
             }
-            throw DeveloperPortalError.invalid2FAResponse(cause: message)
+            throw DeveloperPortalError.invalid2FAResponse(cause: Self.sanitize2FAUserMessage(message))
         }
 
         if statusCode == 503 || statusCode == 433 {
