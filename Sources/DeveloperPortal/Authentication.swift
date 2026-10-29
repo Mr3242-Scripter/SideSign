@@ -261,11 +261,15 @@ public extension DeveloperPortal {
                         try await Task.sleep(nanoseconds: postDelays[attempt])
                     }
 
-                    var post2FAAnisette = anisetteData
+                    // SideInstaller get_anisette_data before login again (fresh OTP, same machine)
+                    var post2FAAnisette = await Self.refreshOTPKeepingMachine(
+                        anisetteData,
+                        lockedCI: lockedCI,
+                        lockedUA: lockedUA
+                    )
                     post2FAAnisette.clientInfo = lockedCI
                     post2FAAnisette.userAgent = lockedUA
                     post2FAAnisette.clientTime = formatter.string(from: Date())
-                    // Keep machineID / oneTimePassword / deviceID from the 2FA session
 
                     debugLog("[SideSign] Post-2FA re-login attempt \(attempt + 1)/\(postDelays.count) same-identity client=\(lockedCI.prefix(48))...")
 
@@ -1073,11 +1077,25 @@ public extension DeveloperPortal {
                                       mode: String,
                                       context: TwoFactorAuthContext) async throws -> TwoFactorAuthValidationResult
     {
-        // SideInstaller verify_sms_2fa — exact:
-        // POST https://gsa.apple.com/auth/verify/phone/securitycode
-        // JSON: { securityCode: { code }, phoneNumber: { id }, mode }
+        // SideInstaller: get_anisette_data again before verify (OTP expires ~60s)
+        var ctx = context
+        let refreshed = await Self.refreshOTPKeepingMachine(
+            context.anisetteData,
+            lockedCI: context.lockedClientInfo,
+            lockedUA: context.lockedUserAgent
+        )
+        ctx = TwoFactorAuthContext(
+            dsid: context.dsid,
+            idmsToken: context.idmsToken,
+            anisetteData: refreshed,
+            xcodeVersion: context.xcodeVersion,
+            lockedClientInfo: context.lockedClientInfo,
+            lockedUserAgent: context.lockedUserAgent
+        )
+
+        // SideInstaller verify_sms_2fa — exact JSON POST
         let securityCodeURL = URL(string: "https://gsa.apple.com/auth/verify/phone/securitycode")!
-        var verifyRequest = makeTwoFactorAuthRequest(url: securityCodeURL, context: context, asMac: false)
+        var verifyRequest = makeTwoFactorAuthRequest(url: securityCodeURL, context: ctx, asMac: false)
         verifyRequest.httpMethod = "POST"
         verifyRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
         verifyRequest.setValue("application/json", forHTTPHeaderField: "Accept")
@@ -1277,6 +1295,74 @@ public extension DeveloperPortal {
         return try await ephemeral.data(for: request)
     }
 
+
+    /// SideInstaller refreshes anisette before verify_sms and before login again (OTP ~60s).
+    /// Same machine (adi / MD-M) when possible; new X-Apple-I-MD only.
+    private static func refreshOTPKeepingMachine(_ original: AnisetteData, lockedCI: String, lockedUA: String) async -> AnisetteData {
+        AnisetteDataManager.shared.clearCache()
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+
+        let mode: AnisetteMode? = AnisetteDataManager.shared.activeMode ?? {
+            let urlStr = UserDefaults.standard.string(forKey: "menuAnisetteURL")
+                ?? UserDefaults.standard.string(forKey: "defaultServerURL")
+                ?? ""
+            guard let url = URL(string: urlStr), !urlStr.isEmpty else { return nil }
+            return .remote(server: url)
+        }()
+
+        guard let mode else {
+            var copy = original
+            copy.clientInfo = lockedCI
+            copy.userAgent = lockedUA
+            copy.clientTime = formatter.string(from: Date())
+            return copy
+        }
+
+        // SideStore stores adi.pb base64 for same-machine get_headers
+        let adiB64 = UserDefaults.standard.string(forKey: "SideSign.anisetteAdiBlob")
+            ?? UserDefaults.standard.string(forKey: "anisetteAdiBlob")
+        let adiBlob = adiB64.flatMap { Data(base64Encoded: $0) }
+
+        let identifier = UUID(uuidString: original.deviceID) ?? UUID()
+        var requestHeaders = original.toRequestHeaders()
+        requestHeaders.clientInfo = lockedCI
+        requestHeaders.userAgent = lockedUA
+        requestHeaders.clientTime = formatter.string(from: Date())
+
+        do {
+            let (fresh, newBlob) = try await AnisetteDataManager.shared.fetchAnisetteData(
+                mode: mode,
+                identifier: identifier,
+                existingAdiBlob: adiBlob,
+                headers: requestHeaders
+            )
+            if let newBlob {
+                UserDefaults.standard.set(newBlob.base64EncodedString(), forKey: "SideSign.anisetteAdiBlob")
+            }
+            var result = fresh
+            // Keep machine id from session when server returns a new one mid-login (avoid identity break)
+            if !original.machineID.isEmpty {
+                result.machineID = original.machineID
+            }
+            if !original.deviceID.isEmpty {
+                result.deviceID = original.deviceID
+            }
+            result.clientInfo = lockedCI
+            result.userAgent = lockedUA
+            result.clientTime = formatter.string(from: Date())
+            debugLog("[SideSign] Refreshed OTP for 2FA/login (same machine when adi present)")
+            return result
+        } catch {
+            debugLog("[SideSign] OTP refresh failed (\(error)); using prior OTP + new clientTime")
+            var copy = original
+            copy.clientInfo = lockedCI
+            copy.userAgent = lockedUA
+            copy.clientTime = formatter.string(from: Date())
+            return copy
+        }
+    }
+
     private static func resolveClientIdentity(from anisetteData: AnisetteData) -> (clientInfo: String, userAgent: String) {
         // SideInstaller remote_v3::client_info_to_use + 1.6.1 Mac ADI path
         // -80046 after the code = Android ADI or non-current Mac through Mac servers
@@ -1309,49 +1395,35 @@ public extension DeveloperPortal {
     private static let macClientInfoFor2FA = "<Mac15,7> <macOS;27.0;26A5378j> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
 
     private func makeTwoFactorAuthRequest(url: URL, context: TwoFactorAuthContext, asMac: Bool = false) -> URLRequest {
+        // SideInstaller build_2fa_headers + send_auth base_headers (minimal set).
+        // Extra headers (Client-Time, Locale, SRL-NO, buddyml Accept, etc.) correlate with HTTP 503.
         let identityToken = "\(context.dsid):\(context.idmsToken)"
         let encodedIdentityToken = Data(identityToken.utf8).base64EncodedString()
+        let a = context.anisetteData
+        let clientInfo = asMac ? Self.macClientInfoFor2FA : context.lockedClientInfo
+        let ua = asMac ? "AuthKit/1 (Macintosh; OS X 27.0) (com.apple.akd/1.0)" : context.lockedUserAgent
 
         var request = URLRequest(url: url)
-        let a = context.anisetteData
-        let h = customHeaders
-        // SideInstaller: same client whole sign-in (locked). Auth pages only switch to
-        // MAC_CLIENT_INFO on bare 403 (performTwoFactorRequest), not on every request.
-        let clientInfo: String
-        let ua: String
-        if asMac {
-            clientInfo = Self.macClientInfoFor2FA
-            ua = "AuthKit/1 (Macintosh; OS X 27.0) (com.apple.akd/1.0)"
-        } else {
-            clientInfo = context.lockedClientInfo
-            ua = context.lockedUserAgent
-        }
+        // Defaults match SideInstaller non-JSON auth pages; callers override for JSON phone.
         let headers: [String: String] = [
-            "Accept": "application/x-buddyml",
-            "Accept-Language": "en-us",
-            "Content-Type": "application/x-plist",
+            "Content-Type": "text/x-xml-plist",
+            "Accept": "text/x-xml-plist",
             "User-Agent": ua,
-            "X-Apple-App-Info": h.grandSlam.authApp,
-            "X-Xcode-Version": context.xcodeVersion,
+            "X-Mme-Client-Info": clientInfo,
+            "X-Xcode-Version": "14.2 (14C18)",
+            "X-Apple-App-Info": "com.apple.gs.xcode.auth",
             "X-Apple-Identity-Token": encodedIdentityToken,
+            // SideInstaller get_headers: only these three anisette fields on 2FA pages
+            "X-Mme-Device-Id": a.deviceID,
             "X-Apple-I-MD": a.oneTimePassword,
             "X-Apple-I-MD-M": a.machineID,
-            "X-Mme-Device-Id": a.deviceID,
-            "X-Mme-Client-Info": clientInfo,
-            "X-Apple-I-MD-LU": a.localUserID,
             "X-Apple-I-MD-RINFO": a.routingInfo,
-            "X-Apple-I-SRL-NO": a.serialNumber,
-            "X-Apple-I-Client-Time": a.clientTime,
-            "X-Apple-Locale": a.locale,
-            "X-Apple-I-TimeZone": a.timeZone,
-            "Connection": "close"
+            "Connection": "close",
         ]
         headers.forEach { request.setValue($1, forHTTPHeaderField: $0) }
         return request
     }
 
-        /// SideInstaller `send_auth`: gsa.apple.com/auth often refuses Windows with 403/5xx;
-    /// retry once as Mac (MAC_CLIENT_INFO). Do NOT treat generic "ec" substring as service error.
     private func performTwoFactorRequest(_ request: URLRequest, context: TwoFactorAuthContext, actionName: String) async throws -> (Data, HTTPURLResponse) {
         var current = request
         var triedMac = false
