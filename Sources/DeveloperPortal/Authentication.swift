@@ -1302,6 +1302,10 @@ public extension DeveloperPortal {
         AnisetteDataManager.shared.clearCache()
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime]
+        // SideInstaller CURRENT_MAC for Mac ADI — never finish token step as Windows (-80046)
+        let forcedCI = "<MacBookPro18,3> <macOS;26.6;25F84> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
+        let forcedUA = "AuthKit/1 (Macintosh; OS X 26.6) (com.apple.akd/1.0)"
+        _ = lockedCI; _ = lockedUA // callers pass locked; we force CURRENT_MAC for Mac ADI token step
 
         let mode: AnisetteMode? = AnisetteDataManager.shared.activeMode ?? {
             let urlStr = UserDefaults.standard.string(forKey: "menuAnisetteURL")
@@ -1313,8 +1317,8 @@ public extension DeveloperPortal {
 
         guard let mode else {
             var copy = original
-            copy.clientInfo = lockedCI
-            copy.userAgent = lockedUA
+            copy.clientInfo = forcedCI
+            copy.userAgent = forcedUA
             copy.clientTime = formatter.string(from: Date())
             return copy
         }
@@ -1326,8 +1330,8 @@ public extension DeveloperPortal {
 
         let identifier = UUID(uuidString: original.deviceID) ?? UUID()
         var requestHeaders = original.toRequestHeaders()
-        requestHeaders.clientInfo = lockedCI
-        requestHeaders.userAgent = lockedUA
+        requestHeaders.clientInfo = forcedCI
+        requestHeaders.userAgent = forcedUA
         requestHeaders.clientTime = formatter.string(from: Date())
 
         do {
@@ -1340,24 +1344,19 @@ public extension DeveloperPortal {
             if let newBlob {
                 UserDefaults.standard.set(newBlob.base64EncodedString(), forKey: "SideSign.anisetteAdiBlob")
             }
+            // Use the full fresh headers from the same adi.pb (SideInstaller get_headers).
+            // Do NOT splice old machineID onto a new OTP — that mismatch is -80046 after SMS.
             var result = fresh
-            // Keep machine id from session when server returns a new one mid-login (avoid identity break)
-            if !original.machineID.isEmpty {
-                result.machineID = original.machineID
-            }
-            if !original.deviceID.isEmpty {
-                result.deviceID = original.deviceID
-            }
-            result.clientInfo = lockedCI
-            result.userAgent = lockedUA
+            result.clientInfo = forcedCI
+            result.userAgent = forcedUA
             result.clientTime = formatter.string(from: Date())
-            debugLog("[SideSign] Refreshed OTP for 2FA/login (same machine when adi present)")
+            debugLog("[SideSign] Refreshed OTP client=\(forcedCI.prefix(40)) md-m=\(result.machineID.prefix(12))...")
             return result
         } catch {
             debugLog("[SideSign] OTP refresh failed (\(error)); using prior OTP + new clientTime")
             var copy = original
-            copy.clientInfo = lockedCI
-            copy.userAgent = lockedUA
+            copy.clientInfo = forcedCI
+            copy.userAgent = forcedUA
             copy.clientTime = formatter.string(from: Date())
             return copy
         }
