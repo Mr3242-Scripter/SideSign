@@ -742,6 +742,16 @@ public extension DeveloperPortal {
         case retry(message: String)
     }
 
+    // MARK: - SideInstaller LoginState (apple_account.rs) full 2FA
+
+    /// SideInstaller `LoginState` for the 2FA portion of sign-in.
+    private enum SideInstallerLoginState {
+        case needsDevice2FA
+        case needsDevice2FAVerification
+        case needsSMS2FA(phoneID: String)
+        case needsSMS2FAVerification(phoneID: String)
+    }
+
     private func handle2FARequest(isTrustedDevice: Bool,
                             completeResponseDictionary: [String: any Sendable],
                             statusDictionary: [String: any Sendable]?,
@@ -750,7 +760,6 @@ public extension DeveloperPortal {
                             codeAlreadySent: Bool = false) async throws
     {
         guard let verificationHandler else {
-            debugLog("[SideSign] 2FA required but no verificationHandler provided")
             throw DeveloperPortalError.requiresTwoFactorAuthentication
         }
 
@@ -758,126 +767,136 @@ public extension DeveloperPortal {
         if phoneNumbers.isEmpty, let statusDictionary {
             phoneNumbers = parseTrustedPhoneNumbers(from: statusDictionary)
         }
+        let phoneID0 = phoneNumbers.first?.id ?? "1"
+        var ctx = context
+        var pendingError: String? = nil
 
-        // SideInstaller 1.6.1: prefer devices. Apple's "Could not connect to iCloud"
-        // means phone refused — never surface that string; always keep a code field.
-        let phoneCodeRefusedMessage = "Apple won't send a code by text or call to this sign-in, so it was sent to your Apple devices."
-        let deviceCodeUnconfirmedMessage = "Apple didn't confirm sending a code to your Apple devices. If one arrived, enter it; if not, try another way."
-
-        // Always open on trusted-device prompt (codeAlreadySent or not).
-        // Soft-send device push; failure still allows entering a code that arrived.
-        do {
-            try await sendTrustedDevice2FACodeRequest(context: context)
-        } catch {
-            debugLog("[SideSign] Initial device push soft-fail: \(error)")
+        // SideInstaller:
+        //   trustedDeviceSecondaryAuth / pushedCode → NeedsDevice2FA
+        //   secondaryAuth → NeedsSMS2FA; refuse → NeedsDevice2FA
+        var state: SideInstallerLoginState
+        if codeAlreadySent || isTrustedDevice {
+            state = codeAlreadySent ? .needsDevice2FAVerification : .needsDevice2FA
+        } else {
+            state = .needsSMS2FA(phoneID: phoneID0)
         }
-        var currentRequest: TwoFactorRequest = .trustedDevice(
-            error: codeAlreadySent ? nil : deviceCodeUnconfirmedMessage
-        )
-        var activeChannel: TwoFactorAuthChannel? = .trustedDevice
+
+        let phoneMsg = "Apple won't send a code by text or call to this sign-in, so it was sent to your Apple devices."
+        let deviceMsg = "Apple didn't confirm sending a code to your Apple devices. If one arrived, enter it; if not, try another way."
 
         while true {
-            debugLog("[SideSign] Prompting user with 2FA request (\(currentRequest))...")
-            let response = try await verificationHandler(currentRequest)
+            switch state {
+            case .needsDevice2FA:
+                do { try await sendTrustedDevice2FACodeRequest(context: ctx) } catch {
+                    debugLog("[SideSign] SI NeedsDevice2FA soft: \(error)")
+                    pendingError = deviceMsg
+                }
+                state = .needsDevice2FAVerification
 
-            switch response {
+            case .needsSMS2FA(let phoneID):
+                do {
+                    let result = try await sendPhone2FACodeRequest(
+                        mode: "sms", phoneID: phoneID, knownPhoneNumbers: phoneNumbers, context: ctx)
+                    phoneNumbers = result.phoneNumbers.isEmpty ? phoneNumbers : result.phoneNumbers
+                    pendingError = nil
+                    state = .needsSMS2FAVerification(phoneID: result.phoneID)
+                } catch {
+                    debugLog("[SideSign] SI PHONE_CODE_REFUSED → NeedsDevice2FA")
+                    pendingError = phoneMsg
+                    state = .needsDevice2FA
+                }
+
+            case .needsDevice2FAVerification:
+                let err = pendingError
+                pendingError = nil
+                let response = try await verificationHandler(.trustedDevice(error: err))
+                switch response {
                 case .requestTrustedDevice:
-                    do {
-                        try await sendTrustedDevice2FACodeRequest(context: context)
-                        activeChannel = .trustedDevice
-                        currentRequest = .trustedDevice(error: nil)
-                    } catch {
-                        debugLog("[SideSign] Device push failed (\(error)); still accept code")
-                        activeChannel = .trustedDevice
-                        currentRequest = .trustedDevice(error: deviceCodeUnconfirmedMessage)
-                    }
-
-                case .requestSMS(let targetPhoneID):
+                    state = .needsDevice2FA
+                case .requestSMS(let id):
+                    state = .needsSMS2FA(phoneID: id)
+                case .requestVoice(let id):
                     do {
                         let result = try await sendPhone2FACodeRequest(
-                            mode: "sms",
-                            phoneID: targetPhoneID,
-                            knownPhoneNumbers: phoneNumbers,
-                            context: context
-                        )
+                            mode: "voice", phoneID: id, knownPhoneNumbers: phoneNumbers, context: ctx)
                         phoneNumbers = result.phoneNumbers.isEmpty ? phoneNumbers : result.phoneNumbers
-                        activeChannel = .sms(phoneID: result.phoneID)
-                        currentRequest = .sms(phoneNumbers: phoneNumbers, activeID: result.phoneID, error: nil)
+                        state = .needsSMS2FAVerification(phoneID: result.phoneID)
                     } catch {
-                        debugLog("[SideSign] SMS refused (\(error)); never surface iCloud — devices")
-                        do { try await sendTrustedDevice2FACodeRequest(context: context) } catch {}
-                        activeChannel = .trustedDevice
-                        currentRequest = .trustedDevice(error: "Apple won't send a code by text or call to this sign-in, so it was sent to your Apple devices.")
+                        pendingError = phoneMsg
+                        state = .needsDevice2FA
                     }
-
-                case .requestVoice(let targetPhoneID):
-                    do {
-                        let result = try await sendPhone2FACodeRequest(
-                            mode: "voice",
-                            phoneID: targetPhoneID,
-                            knownPhoneNumbers: phoneNumbers,
-                            context: context
-                        )
-                        phoneNumbers = result.phoneNumbers.isEmpty ? phoneNumbers : result.phoneNumbers
-                        activeChannel = .voice(phoneID: result.phoneID)
-                        currentRequest = .voice(phoneNumbers: phoneNumbers, activeID: result.phoneID, error: nil)
-                    } catch {
-                        debugLog("[SideSign] Voice refused (\(error)); never surface iCloud — devices")
-                        do { try await sendTrustedDevice2FACodeRequest(context: context) } catch {}
-                        activeChannel = .trustedDevice
-                        currentRequest = .trustedDevice(error: "Apple won't send a code by text or call to this sign-in, so it was sent to your Apple devices.")
-                    }
-
                 case .verificationCode(let code):
-                    guard let channel = activeChannel else {
-                        activeChannel = .trustedDevice
-                        currentRequest = .trustedDevice(error: deviceCodeUnconfirmedMessage)
-                        continue
-                    }
-                    let result: TwoFactorAuthValidationResult
+                    let refreshed = await Self.refreshOTPKeepingMachine(
+                        ctx.anisetteData, lockedCI: ctx.lockedClientInfo, lockedUA: ctx.lockedUserAgent)
+                    ctx = TwoFactorAuthContext(
+                        dsid: ctx.dsid, idmsToken: ctx.idmsToken, anisetteData: refreshed,
+                        xcodeVersion: ctx.xcodeVersion,
+                        lockedClientInfo: ctx.lockedClientInfo, lockedUserAgent: ctx.lockedUserAgent)
                     do {
-                        switch channel {
-                            case .trustedDevice:
-                                result = try await validateTrustedDevice2FACode(code: code, context: context)
-                            case .sms(let phoneID):
-                                result = try await validatePhone2FACode(code: code, phoneID: phoneID, mode: "sms", context: context)
-                            case .voice(let phoneID):
-                                result = try await validatePhone2FACode(code: code, phoneID: phoneID, mode: "voice", context: context)
-                        }
-                    } catch {
-                        debugLog("[SideSign] Code validation error (\(error)); device prompt only (no Apple iCloud text)")
-                        activeChannel = .trustedDevice
-                        currentRequest = .trustedDevice(error: "Apple won't send a code by text or call to this sign-in, so it was sent to your Apple devices.")
-                        continue
-                    }
-                    switch result {
+                        switch try await validateTrustedDevice2FACode(code: code, context: ctx) {
                         case .success:
-                            debugLog("[SideSign] 2FA code verified successfully!")
                             return
                         case .retry(let message):
-                            // Never put Apple's iCloud / raw error on the SMS channel UI
-                            let safe: String
-                            if Self.isPhoneOrICloudRefuse(message) || message.contains("PHONE_CODE_REFUSED") || message.lowercased().contains("icloud") {
-                                safe = "Apple won't send a code by text or call to this sign-in, so it was sent to your Apple devices."
-                                do { try await sendTrustedDevice2FACodeRequest(context: context) } catch {}
-                                activeChannel = .trustedDevice
-                                currentRequest = .trustedDevice(error: safe)
-                                continue
-                            }
-                            safe = Self.sanitize2FAUserMessage(message)
-                            switch channel {
-                                case .trustedDevice:
-                                    currentRequest = .trustedDevice(error: safe)
-                                case .sms(let phoneID):
-                                    currentRequest = .sms(phoneNumbers: phoneNumbers, activeID: phoneID, error: safe)
-                                case .voice(let phoneID):
-                                    currentRequest = .voice(phoneNumbers: phoneNumbers, activeID: phoneID, error: safe)
-                            }
+                            pendingError = Self.sanitize2FAUserMessage(message)
+                            state = .needsDevice2FAVerification
+                        }
+                    } catch {
+                        pendingError = Self.sanitize2FAUserMessage("\(error)")
+                        state = .needsDevice2FAVerification
                     }
-
                 case .cancel:
-                    debugLog("[SideSign] User cancelled 2FA.")
                     throw DeveloperPortalError.userCancelled
+                }
+
+            case .needsSMS2FAVerification(let phoneID):
+                let err = pendingError
+                pendingError = nil
+                let response = try await verificationHandler(
+                    .sms(phoneNumbers: phoneNumbers, activeID: phoneID, error: err))
+                switch response {
+                case .requestTrustedDevice:
+                    state = .needsDevice2FA
+                case .requestSMS(let id):
+                    state = .needsSMS2FA(phoneID: id)
+                case .requestVoice(let id):
+                    do {
+                        let result = try await sendPhone2FACodeRequest(
+                            mode: "voice", phoneID: id, knownPhoneNumbers: phoneNumbers, context: ctx)
+                        phoneNumbers = result.phoneNumbers.isEmpty ? phoneNumbers : result.phoneNumbers
+                        state = .needsSMS2FAVerification(phoneID: result.phoneID)
+                    } catch {
+                        pendingError = phoneMsg
+                        state = .needsDevice2FA
+                    }
+                case .verificationCode(let code):
+                    let refreshed = await Self.refreshOTPKeepingMachine(
+                        ctx.anisetteData, lockedCI: ctx.lockedClientInfo, lockedUA: ctx.lockedUserAgent)
+                    ctx = TwoFactorAuthContext(
+                        dsid: ctx.dsid, idmsToken: ctx.idmsToken, anisetteData: refreshed,
+                        xcodeVersion: ctx.xcodeVersion,
+                        lockedClientInfo: ctx.lockedClientInfo, lockedUserAgent: ctx.lockedUserAgent)
+                    do {
+                        switch try await validatePhone2FACode(
+                            code: code, phoneID: phoneID, mode: "sms", context: ctx) {
+                        case .success:
+                            return
+                        case .retry(let message):
+                            if Self.isPhoneOrICloudRefuse(message) {
+                                pendingError = phoneMsg
+                                state = .needsDevice2FA
+                            } else {
+                                pendingError = Self.sanitize2FAUserMessage(message)
+                                state = .needsSMS2FAVerification(phoneID: phoneID)
+                            }
+                        }
+                    } catch {
+                        debugLog("[SideSign] SI SMS verify error → NeedsDevice2FA: \(error)")
+                        pendingError = phoneMsg
+                        state = .needsDevice2FA
+                    }
+                case .cancel:
+                    throw DeveloperPortalError.userCancelled
+                }
             }
         }
     }
@@ -1365,32 +1384,33 @@ public extension DeveloperPortal {
     }
 
     private static func resolveClientIdentity(from anisetteData: AnisetteData) -> (clientInfo: String, userAgent: String) {
-        // SideInstaller remote_v3::client_info_to_use + 1.6.1 Mac ADI path
-        // -80046 after the code = Android ADI or non-current Mac through Mac servers
+        // SideInstaller remote_v3::client_info_to_use — exact parity
         let currentMac = "<MacBookPro18,3> <macOS;26.6;25F84> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
         let currentMacUA = "AuthKit/1 (Macintosh; OS X 26.6) (com.apple.akd/1.0)"
         let windows = "<PC> <Windows;6.2(0,0);9200> <com.apple.AuthKit/1 (com.apple.iTunes/12.12.4.1)>"
         let akdUA = "akd/1.0 CFNetwork/808.1.4"
-        let stockPrefixes = [
-            "<MacBookPro13,2> <macOS;13.1;22C65>",
-            "<MacBookPro15,1> <Mac OS X;10.15.2;19C57>",
-        ]
         let advertised = anisetteData.clientInfo.trimmingCharacters(in: .whitespacesAndNewlines)
-        let isAndroid = advertised.contains("<Android;")
-        let isStock = stockPrefixes.contains { advertised.hasPrefix($0) }
-        // Android / stock omnisette → Windows only when not using Mac ADI (SideInstaller skips Android login)
-        if advertised.isEmpty || isAndroid || isStock {
-            // Prefer CURRENT_MAC so Mac-server sessions never finish as Windows (-80046)
+        let stock = advertised.hasPrefix("<MacBookPro13,2> <macOS;13.1;22C65>")
+            || advertised.hasPrefix("<MacBookPro15,1> <Mac OS X;10.15.2;19C57>")
+        let android = advertised.contains("<Android;")
+        if advertised.isEmpty || android || stock {
+            // SideInstaller: Android/stock → Windows; we use CURRENT_MAC when SideStore is on Mac ADI
+            // (SideInstaller never logs in through Android ADI anymore)
             return (currentMac, currentMacUA)
         }
-        // Any Mac (including 10.12 named by Mac ADI servers) → CURRENT_MAC (SideInstaller 1.6.1)
+        // mac_version < 10.13 (Mac ADI servers name 10.12.6)
+        if advertised.contains("10.12") || advertised.contains("Mac OS X;10.11") || advertised.contains("Mac OS X;10.10") {
+            return (currentMac, currentMacUA)
+        }
         if advertised.contains("MacBook") || advertised.contains("Mac OS") || advertised.contains("macOS") || advertised.contains("<Mac") {
             return (currentMac, currentMacUA)
         }
         if advertised.contains("<PC>") || advertised.contains("Windows") {
             return (windows, akdUA)
         }
-        return (currentMac, currentMacUA)
+        var ua = anisetteData.userAgent.trimmingCharacters(in: .whitespacesAndNewlines)
+        if ua.isEmpty { ua = akdUA }
+        return (advertised, ua)
     }
 
     private static let macClientInfoFor2FA = "<Mac15,7> <macOS;27.0;26A5378j> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
