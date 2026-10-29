@@ -664,8 +664,6 @@ public extension DeveloperPortal {
                 .filter { !$0.isEmpty }
                 .joined(separator: ": ")
             debugLog("[SideSign] \(actionName) alert from Apple (HTTP \(statusCode)): \(alertMsg)")
-            // SideInstaller: never surface Apple's "Could not connect to iCloud" — map to phone refused
-            let lower = alertMsg.lowercased()
             // Always map to PHONE_CODE_REFUSED — never pass Apple's iCloud wording to the UI
             throw DeveloperPortalError.invalid2FAResponse(cause: "PHONE_CODE_REFUSED")
         }
@@ -1140,7 +1138,7 @@ public extension DeveloperPortal {
             var lastData = verifyData
             var lastStatus = verifyStatusCode
             var lastHttp = verifyHttpResponse
-            for (i, delay) in [3_000_000_000, 8_000_000_000, 15_000_000_000].enumerated() {
+            for (i, delay) in [UInt64(3_000_000_000), UInt64(8_000_000_000), UInt64(15_000_000_000)].enumerated() {
                 debugLog("[SideSign] Phone code submit HTTP \(lastStatus) — retry \(i + 1) after \(delay / 1_000_000_000)s")
                 try await Task.sleep(nanoseconds: delay)
                 let (retryData, retryHttp) = try await performTwoFactorRequest(verifyRequest, context: context, actionName: "validatePhone2FACode-retry")
