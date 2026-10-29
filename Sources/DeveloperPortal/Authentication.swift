@@ -804,10 +804,10 @@ public extension DeveloperPortal {
                         activeChannel = .sms(phoneID: result.phoneID)
                         currentRequest = .sms(phoneNumbers: phoneNumbers, activeID: result.phoneID, error: nil)
                     } catch {
-                        debugLog("[SideSign] SMS refused (\(error)); PHONE_CODE_REFUSED → devices")
+                        debugLog("[SideSign] SMS refused (\(error)); never surface iCloud — devices")
                         do { try await sendTrustedDevice2FACodeRequest(context: context) } catch {}
                         activeChannel = .trustedDevice
-                        currentRequest = .trustedDevice(error: phoneCodeRefusedMessage)
+                        currentRequest = .trustedDevice(error: "Apple won't send a code by text or call to this sign-in, so it was sent to your Apple devices.")
                     }
 
                 case .requestVoice(let targetPhoneID):
@@ -822,10 +822,10 @@ public extension DeveloperPortal {
                         activeChannel = .voice(phoneID: result.phoneID)
                         currentRequest = .voice(phoneNumbers: phoneNumbers, activeID: result.phoneID, error: nil)
                     } catch {
-                        debugLog("[SideSign] Voice refused (\(error)); PHONE_CODE_REFUSED → devices")
+                        debugLog("[SideSign] Voice refused (\(error)); never surface iCloud — devices")
                         do { try await sendTrustedDevice2FACodeRequest(context: context) } catch {}
                         activeChannel = .trustedDevice
-                        currentRequest = .trustedDevice(error: phoneCodeRefusedMessage)
+                        currentRequest = .trustedDevice(error: "Apple won't send a code by text or call to this sign-in, so it was sent to your Apple devices.")
                     }
 
                 case .verificationCode(let code):
@@ -845,11 +845,9 @@ public extension DeveloperPortal {
                                 result = try await validatePhone2FACode(code: code, phoneID: phoneID, mode: "voice", context: context)
                         }
                     } catch {
-                        // Never bubble "Could not connect to iCloud"
-                        let msg = "\(error)"
-                        debugLog("[SideSign] Code validation error (\(msg)); back to device prompt")
+                        debugLog("[SideSign] Code validation error (\(error)); device prompt only (no Apple iCloud text)")
                         activeChannel = .trustedDevice
-                        currentRequest = .trustedDevice(error: Self.isPhoneOrICloudRefuse(msg) ? phoneCodeRefusedMessage : deviceCodeUnconfirmedMessage)
+                        currentRequest = .trustedDevice(error: "Apple won't send a code by text or call to this sign-in, so it was sent to your Apple devices.")
                         continue
                     }
                     switch result {
@@ -857,19 +855,23 @@ public extension DeveloperPortal {
                             debugLog("[SideSign] 2FA code verified successfully!")
                             return
                         case .retry(let message):
-                            if Self.isPhoneOrICloudRefuse(message) || message.contains("PHONE_CODE_REFUSED") {
+                            // Never put Apple's iCloud / raw error on the SMS channel UI
+                            let safe: String
+                            if Self.isPhoneOrICloudRefuse(message) || message.contains("PHONE_CODE_REFUSED") || message.lowercased().contains("icloud") {
+                                safe = "Apple won't send a code by text or call to this sign-in, so it was sent to your Apple devices."
                                 do { try await sendTrustedDevice2FACodeRequest(context: context) } catch {}
                                 activeChannel = .trustedDevice
-                                currentRequest = .trustedDevice(error: phoneCodeRefusedMessage)
+                                currentRequest = .trustedDevice(error: safe)
                                 continue
                             }
+                            safe = Self.sanitize2FAUserMessage(message)
                             switch channel {
                                 case .trustedDevice:
-                                    currentRequest = .trustedDevice(error: message)
+                                    currentRequest = .trustedDevice(error: safe)
                                 case .sms(let phoneID):
-                                    currentRequest = .sms(phoneNumbers: phoneNumbers, activeID: phoneID, error: message)
+                                    currentRequest = .sms(phoneNumbers: phoneNumbers, activeID: phoneID, error: safe)
                                 case .voice(let phoneID):
-                                    currentRequest = .voice(phoneNumbers: phoneNumbers, activeID: phoneID, error: message)
+                                    currentRequest = .voice(phoneNumbers: phoneNumbers, activeID: phoneID, error: safe)
                             }
                     }
 
