@@ -1131,7 +1131,7 @@ public extension DeveloperPortal {
         }
 
         debugLog("[SideSign] Verifying phone security code (SideInstaller JSON)...")
-        let (verifyData, verifyHttpResponse) = try await performTwoFactorRequest(verifyRequest, context: context, actionName: "validatePhone2FACode")
+        let (verifyData, verifyHttpResponse) = try await performTwoFactorRequest(verifyRequest, context: ctx, actionName: "validatePhone2FACode")
         let verifyStatusCode = verifyHttpResponse.safeStatusCode
         // SideInstaller: non-success → parse error; -21669 = wrong code → retry
         if verifyStatusCode == 503 || verifyStatusCode == 433 {
@@ -1141,7 +1141,7 @@ public extension DeveloperPortal {
             for (i, delay) in [UInt64(3_000_000_000), UInt64(8_000_000_000), UInt64(15_000_000_000)].enumerated() {
                 debugLog("[SideSign] Phone code submit HTTP \(lastStatus) — retry \(i + 1) after \(delay / 1_000_000_000)s")
                 try await Task.sleep(nanoseconds: delay)
-                let (retryData, retryHttp) = try await performTwoFactorRequest(verifyRequest, context: context, actionName: "validatePhone2FACode-retry")
+                let (retryData, retryHttp) = try await performTwoFactorRequest(verifyRequest, context: ctx, actionName: "validatePhone2FACode-retry")
                 lastData = retryData
                 lastStatus = retryHttp.safeStatusCode
                 lastHttp = retryHttp
@@ -1317,14 +1317,34 @@ public extension DeveloperPortal {
 
     /// SideInstaller refreshes anisette before verify_sms and before login again (OTP ~60s).
     /// Same machine (adi / MD-M) when possible; new X-Apple-I-MD only.
+    /// SideInstaller refreshes OTP via get_headers on the SAME adi.pb.
+    /// Without adi.pb, only bump clientTime — never provision a new machine (that → HTTP 503 after SMS).
     private static func refreshOTPKeepingMachine(_ original: AnisetteData, lockedCI: String, lockedUA: String) async -> AnisetteData {
         AnisetteDataManager.shared.clearCache()
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime]
-        // SideInstaller CURRENT_MAC for Mac ADI — never finish token step as Windows (-80046)
         let forcedCI = "<MacBookPro18,3> <macOS;26.6;25F84> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
         let forcedUA = "AuthKit/1 (Macintosh; OS X 26.6) (com.apple.akd/1.0)"
-        _ = lockedCI; _ = lockedUA // callers pass locked; we force CURRENT_MAC for Mac ADI token step
+        _ = lockedCI
+        _ = lockedUA
+
+        func stamp(_ data: AnisetteData) -> AnisetteData {
+            var copy = data
+            copy.clientInfo = forcedCI
+            copy.userAgent = forcedUA
+            copy.clientTime = formatter.string(from: Date())
+            return copy
+        }
+
+        let adiB64 = UserDefaults.standard.string(forKey: "SideSign.anisetteAdiBlob")
+            ?? UserDefaults.standard.string(forKey: "anisetteAdiBlob")
+        let adiBlob = adiB64.flatMap { Data(base64Encoded: $0) }
+
+        // No saved identity → keep machine + OTP from password step (SideInstaller always has state)
+        guard let adiBlob, !adiBlob.isEmpty else {
+            debugLog("[SideSign] No adi.pb for OTP refresh — keeping same machine/OTP, new clientTime only")
+            return stamp(original)
+        }
 
         let mode: AnisetteMode? = AnisetteDataManager.shared.activeMode ?? {
             let urlStr = UserDefaults.standard.string(forKey: "menuAnisetteURL")
@@ -1335,17 +1355,8 @@ public extension DeveloperPortal {
         }()
 
         guard let mode else {
-            var copy = original
-            copy.clientInfo = forcedCI
-            copy.userAgent = forcedUA
-            copy.clientTime = formatter.string(from: Date())
-            return copy
+            return stamp(original)
         }
-
-        // SideStore stores adi.pb base64 for same-machine get_headers
-        let adiB64 = UserDefaults.standard.string(forKey: "SideSign.anisetteAdiBlob")
-            ?? UserDefaults.standard.string(forKey: "anisetteAdiBlob")
-        let adiBlob = adiB64.flatMap { Data(base64Encoded: $0) }
 
         let identifier = UUID(uuidString: original.deviceID) ?? UUID()
         var requestHeaders = original.toRequestHeaders()
@@ -1363,21 +1374,17 @@ public extension DeveloperPortal {
             if let newBlob {
                 UserDefaults.standard.set(newBlob.base64EncodedString(), forKey: "SideSign.anisetteAdiBlob")
             }
-            // Use the full fresh headers from the same adi.pb (SideInstaller get_headers).
-            // Do NOT splice old machineID onto a new OTP — that mismatch is -80046 after SMS.
-            var result = fresh
-            result.clientInfo = forcedCI
-            result.userAgent = forcedUA
-            result.clientTime = formatter.string(from: Date())
-            debugLog("[SideSign] Refreshed OTP client=\(forcedCI.prefix(40)) md-m=\(result.machineID.prefix(12))...")
+            // Accept full fresh headers for THIS adi only (SideInstaller get_headers)
+            var result = stamp(fresh)
+            // Hard-lock machine/device from the live session if server returns empty
+            if result.machineID.isEmpty { result.machineID = original.machineID }
+            if result.deviceID.isEmpty { result.deviceID = original.deviceID }
+            if result.oneTimePassword.isEmpty { result.oneTimePassword = original.oneTimePassword }
+            debugLog("[SideSign] OTP refreshed with existing adi.pb md-m=\(result.machineID.prefix(12))...")
             return result
         } catch {
-            debugLog("[SideSign] OTP refresh failed (\(error)); using prior OTP + new clientTime")
-            var copy = original
-            copy.clientInfo = forcedCI
-            copy.userAgent = forcedUA
-            copy.clientTime = formatter.string(from: Date())
-            return copy
+            debugLog("[SideSign] OTP refresh failed (\(error)); same machine/OTP + new clientTime")
+            return stamp(original)
         }
     }
 
